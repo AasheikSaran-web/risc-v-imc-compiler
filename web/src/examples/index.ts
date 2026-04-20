@@ -75,6 +75,19 @@ const vectorMaxSource = `kernel vector_max(global int* a, global int* b, global 
     }
 }`;
 
+// Crossbar MVM: each thread programs one row of the weight matrix, then runs analog MVM
+const crossbarMVMSource = `kernel crossbar_mvm(global int* weights, global int* input, global int* output) {
+    // Phase 1: each thread loads its weight and programs one crossbar row
+    int tid = threadIdx;
+    int w = weights[tid];
+    cset(tid, 1, w);
+    __syncthreads();
+    // Phase 2: thread 0 runs the analog matrix-vector multiply
+    if (tid < 1) {
+        mvm(output, input);
+    }
+}`;
+
 // NEW: Shared memory tiled vector add - demonstrates shared mem + syncthreads
 const sharedTileAddSource = `kernel shared_tile_add(global int* a, global int* b, global int* c) {
     shared int tile_a[4];
@@ -104,6 +117,22 @@ const sharedReductionSource = `kernel shared_reduce(global int* input, global in
 }`;
 
 export const EXAMPLES: Example[] = [
+  {
+    name: 'Crossbar MVM',
+    description: 'CSET weights → analog MVM',
+    source: crossbarMVMSource,
+    trace: compileTGC(crossbarMVMSource),
+    initialMemory: (() => {
+      const mem = new Array(256).fill(0);
+      // weights[0..3] at mem[0..3]: high conductances for visible MVM result
+      mem[0] = 255; mem[1] = 200; mem[2] = 150; mem[3] = 100;
+      // input[0..3] at mem[64..67]
+      mem[64] = 100; mem[65] = 150; mem[66] = 200; mem[67] = 250;
+      return mem;
+    })(),
+    numBlocks: 1,
+    threadsPerBlock: 4,
+  },
   {
     name: 'Vector Add',
     description: 'c[i] = a[i] + b[i]',

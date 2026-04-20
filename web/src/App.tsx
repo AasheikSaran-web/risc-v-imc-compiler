@@ -122,6 +122,7 @@ export default function App() {
                 <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#4ec9b0' }}>
                   {trace.analysis.metrics.totalInstructions} inst | {trace.analysis.metrics.registersUsed} regs
                   {trace.analysis.metrics.imcOperations > 0 && ` | ${trace.analysis.metrics.imcOperations} MVM`}
+                  {(trace.analysis.metrics.crossbarWriteOps ?? 0) > 0 && ` | ${trace.analysis.metrics.crossbarWriteOps} CSET`}
                   {trace.analysis.metrics.sharedMemoryBytes > 0 && ` | ${trace.analysis.metrics.sharedMemoryBytes}B scratch`}
                 </span>
               )}

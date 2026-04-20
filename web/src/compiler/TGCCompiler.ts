@@ -13,7 +13,7 @@ import { CompilationTrace, Instruction, AnalysisResult, DivergenceInfo, Coalesci
 // =============================================================================
 
 type TokenKind =
-  | 'kernel' | 'global' | 'int' | 'for' | 'if' | 'else' | 'shared' | 'mvm'
+  | 'kernel' | 'global' | 'int' | 'for' | 'if' | 'else' | 'shared' | 'mvm' | 'cset'
   | 'threadIdx' | 'blockIdx' | 'blockDim'
   | '__syncthreads'
   | 'ident' | 'number'
@@ -31,7 +31,7 @@ interface Token {
 function lex(source: string): Token[] {
   const tokens: Token[] = [];
   let pos = 0, line = 1, col = 1;
-  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm']);
+  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm', 'cset']);
   const builtins = new Set(['threadIdx', 'blockIdx', 'blockDim']);
 
   while (pos < source.length) {
@@ -118,6 +118,7 @@ type Stmt =
   | { type: 'shared_decl'; name: string; size: number }
   | { type: 'syncthreads' }
   | { type: 'mvm'; output: string; input: string }
+  | { type: 'cset'; row: Expr; col: Expr; val: Expr }  // Program crossbar cell
   | { type: 'for'; init: Stmt; cond: Expr; iterVar: string; iterExpr: Expr; body: Stmt[] }
   | { type: 'if'; cond: Expr; then: Stmt[]; else: Stmt[] };
 
@@ -202,6 +203,21 @@ function parse(tokens: Token[]): Kernel {
       expect(')');
       expect(';');
       return { type: 'mvm', output, input };
+    }
+    if (peek().kind === 'cset') {
+      // cset(row_expr, col_expr, val_expr)
+      // Compiles to CSET rd=val_reg, rs1=row_reg, rs2=col_reg (custom-0, funct3=0x3)
+      // Internally programs crossbar[row][col] = valueToConductance(val)
+      advance();
+      expect('(');
+      const row = parseExpr();
+      expect(',');
+      const col = parseExpr();
+      expect(',');
+      const val = parseExpr();
+      expect(')');
+      expect(';');
+      return { type: 'cset', row, col, val };
     }
     if (peek().kind === 'for') {
       advance(); expect('(');
@@ -595,6 +611,25 @@ function compile(kernel: Kernel): {
         irOps.push({ op: 'MVM', rd: outReg, rs: inReg, asm: `MVM ${asmReg(outReg)}, ${asmReg(inReg)}`, isMVM: true });
         break;
       }
+      case 'cset': {
+        // Evaluate row, col, and value expressions into registers
+        const rowSSA = genExpr(stmt.row);
+        const colSSA = genExpr(stmt.col);
+        const valSSA = genExpr(stmt.val);
+        const rowReg = regOf(rowSSA);
+        const colReg = regOf(colSSA);
+        const valReg = regOf(valSSA);
+        irLines.push(`  riscv.cset crossbar[${regName(rowReg)}][${regName(colReg)}] = ${regName(valReg)}`);
+        irLines.push(`  // → pot/dep pulses at (${regName(rowReg)}, ${regName(colReg)}), G_target = valueToConductance(${regName(valReg)})`);
+        irOps.push({
+          op: 'CSET',
+          rd: valReg,   // value source (rd used as source register, not destination)
+          rs: rowReg,   // rs1 = row
+          rt: colReg,   // rs2 = col
+          asm: `CSET ${asmReg(valReg)}, ${asmReg(rowReg)}, ${asmReg(colReg)}`,
+        });
+        break;
+      }
       case 'store': {
         const indexSSA = genExpr(stmt.index);
         const valueSSA = genExpr(stmt.value);
@@ -740,6 +775,7 @@ function compile(kernel: Kernel): {
       case 'SLDR':  binary = encodeR(0x0B, rd, 0x1, rs1, 0, 0x00); break;
       case 'SSTR':  binary = encodeR(0x0B, 0,  0x2, rs1, rs2, 0x00); break;
       case 'MVM':   binary = encodeR(0x0B, rd, 0x0, rs1, 0, 0x00); break;
+      case 'CSET':  binary = encodeR(0x0B, rd, 0x3, rs1, rs2, 0x00); break;
       case 'FENCE': binary = 0x0000100F; break;
       case 'ECALL': binary = 0x00000073; break;
       case 'BEQ':   binary = encodeB(0x63, 0x0, rs1, rs2, (target - i) * 4); break;
@@ -802,6 +838,7 @@ function analyzeCompilation(
   let computeCount = 0;
   let barrierCount = 0;
   let imcOps = 0;
+  let csetOps = 0;
   let sharedMemBytes = 0;
 
   for (const stmt of kernel.body) {
@@ -873,6 +910,18 @@ function analyzeCompilation(
       });
     }
 
+    if (op.op === 'CSET') {
+      csetOps++;
+      memoryCount++;
+      coalescing.push({
+        instructionAddr: i,
+        accessPattern: 'coalesced',
+        addresses: [],
+        transactionsNeeded: 1,
+        description: 'Crossbar CSET: programs one memristor cell via pot/dep pulse sequence (80ns@900mV each step)',
+      });
+    }
+
     if (op.isBarrier) barrierCount++;
     if (['ADD', 'SUB', 'MUL', 'DIV', 'ADDI'].includes(op.op)) computeCount++;
   }
@@ -895,11 +944,12 @@ function analyzeCompilation(
       memoryInstructions: memoryCount,
       computeInstructions: computeCount,
       imcOperations: imcOps,
+      crossbarWriteOps: csetOps,
       barrierCount,
       estimatedCycles,
       crossbarCyclesSaved,
       computeToMemoryRatio: Math.round(computeToMemoryRatio * 100) / 100,
-      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} crossbar MVM ops` : ''}`,
+      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} MVM ops` : ''}${csetOps > 0 ? `, ${csetOps} CSET writes` : ''}`,
     },
   };
 }

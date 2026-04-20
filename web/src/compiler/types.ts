@@ -38,6 +38,7 @@ export interface PerformanceMetrics {
   memoryInstructions: number;
   computeInstructions: number;
   imcOperations: number;         // MVM crossbar instructions
+  crossbarWriteOps: number;      // CSET instructions
   barrierCount: number;
   estimatedCycles: number;
   crossbarCyclesSaved: number;   // Cycles saved vs scalar multiply-accumulate
@@ -62,6 +63,48 @@ export interface CompilationTrace {
   analysis?: AnalysisResult;
 }
 
+// Pre-compute G_STEP to avoid self-reference in object literal
+const _G_STEP_US = (5900.0 - 0.2) / (16520 - 1);  // ≈ 0.35715 µS/level
+
+/**
+ * Physical memristor device constants from:
+ * "Linear symmetric self-selecting 14-bit kinetic molecular memristors"
+ * Nature 633, Sep 2024 — [RuIIL](BF₄)₂ on a 64×64 crossbar
+ */
+export const MEMRISTOR_PHYSICS = {
+  G_MIN_US:      0.2,          // µS  — minimum conductance (200 nS)
+  G_MAX_US:      5900.0,       // µS  — maximum conductance (5.9 mS)
+  LEVELS:        16520,        // analog conductance levels (≈14-bit)
+  G_STEP_US:     _G_STEP_US,  // µS per level  ≈ 0.35715
+  POT_V_MV:      900,          // mV  — potentiation pulse voltage
+  POT_NS:        80,           // ns  — potentiation pulse width
+  DEP_V_MV:      750,          // mV  — depression pulse voltage (absolute)
+  DEP_NS:        65,           // ns  — depression pulse width
+  VTH_MV:        830,          // mV  — write threshold voltage
+  READ_V_MV:     500,          // mV  — non-disturbing read voltage
+  HALF_SEL_MV:   450,          // mV  — half-select voltage (below VTH)
+  RMSE_NS:       42,           // nS  — write accuracy RMSE target → achieved
+  SNR_DB:        73,           // dB  — signal-to-noise ratio (73–79 dB range)
+  CROSSBAR_SIZE: 64,           // 64×64 molecular memristor array
+  MATERIAL:      '[RuIIL](BF₄)₂ kinetic molecular memristor',
+  PAPER_REF:     'Nature 633, Sep 2024',
+} as const;
+
+/**
+ * A single memristor write event: a potentiation or depression pulse sequence
+ * that programs one crossbar cell to a new conductance level.
+ */
+export interface MemristorWriteEvent {
+  cycle: number;
+  row: number;
+  col: number;
+  prevG_us: number;             // conductance before write (µS)
+  newG_us: number;              // conductance after write (µS)
+  pulseType: 'pot' | 'dep' | 'hold';  // potentiation / depression / no change
+  pulseCount: number;           // estimated pulses applied (ΔG / G_STEP)
+  registerName?: string;        // ABI name if col=0 (register-file cell)
+}
+
 /** RISC-V base opcodes (7-bit) */
 export enum RVOpcode {
   OP       = 0x33,  // R-type: ADD, SUB, MUL, DIV
@@ -71,7 +114,7 @@ export enum RVOpcode {
   BRANCH   = 0x63,  // BEQ, BNE, BLT, BGE
   JAL      = 0x6F,  // Unconditional jump
   LUI      = 0x37,  // Load upper immediate
-  CUSTOM0  = 0x0B,  // Custom: MVM / SLDR / SSTR (memristor crossbar)
+  CUSTOM0  = 0x0B,  // Custom: MVM / SLDR / SSTR / CSET (memristor crossbar)
   MISC_MEM = 0x0F,  // FENCE (thread barrier)
   SYSTEM   = 0x73,  // ECALL (thread completion)
 }
@@ -106,17 +149,28 @@ export interface ThreadState {
   threadId: number;
   blockId: number;
   pc: number;
-  registers: number[];       // x0-x31 (32-bit general purpose)
+  registers: number[];       // x0–x31 (32-bit general purpose)
   stage: PipelineStage;
   done: boolean;
   currentInstruction: string;
   divergent?: boolean;
 }
 
-/** Memristor crossbar state (16×16 conductance grid) */
+/**
+ * 64×64 memristor crossbar state (all conductances in µS).
+ *
+ * Physical layout:
+ *   Column 0         — register-file backing: row r stores the conductance
+ *                      encoding of RISC-V register xr (r = 0..31).
+ *   Columns 1–63     — weight matrix for MVM operations.
+ *
+ * The VMM formula (Kirchhoff's current law):
+ *   I_Q = Σ_P  V_P · G_{P,Q}     (analog, single-cycle)
+ */
 export interface CrossbarState {
-  conductances: number[][];    // 16×16 grid (0-255 = conductance level)
-  lastMVMResult: number[];     // Output of the most recent MVM operation
+  conductances: number[][];          // 64×64 grid in µS
+  lastMVMResult: number[];           // 16-element output of most recent MVM
+  writeEvents: MemristorWriteEvent[]; // recent write history (capped at 20)
 }
 
 /** Full IMC simulation state at one cycle */
@@ -125,7 +179,7 @@ export interface SimulationState {
   threads: ThreadState[];
   memory: number[];            // 256-byte global data memory
   sharedMemory: number[];      // 64-byte shared scratchpad per block
-  crossbar: CrossbarState;     // Memristor crossbar array
+  crossbar: CrossbarState;     // 64×64 memristor crossbar
   currentBlock: number;
   totalBlocks: number;
 }
