@@ -1,10 +1,10 @@
 # RISC-V IMC Compiler
 
-**An MLIR-based compiler that lowers parallel kernels to RISC-V instructions executing on a memristor crossbar — making In-Memory Compute visible, step by step.**
+**An MLIR-based compiler that lowers parallel kernels to RISC-V instructions executing on a 64×64 molecular memristor crossbar — making In-Memory Compute visible, step by step.**
 
-Most engineers know that matrix operations are the bottleneck in modern ML workloads. Few understand how a compiler bridges high-level code and analog hardware that computes inside memory itself. This project makes that journey visible. Write a kernel in a C-like DSL, watch it lower through RISC-V intermediate representations, see 32-bit binary instructions get emitted, and then simulate those instructions running on a memristor crossbar — all in your browser.
+Write a kernel in a C-like DSL, watch it lower through RISC-V intermediate representations, see 32-bit binary instructions get emitted, and then simulate those instructions running on a memristor crossbar — all in your browser.
 
-Built on [MLIR](https://mlir.llvm.org/), targeting a **RISC-V RV32IM** core augmented with a custom **memristor crossbar In-Memory Compute** extension.
+Built on [MLIR](https://mlir.llvm.org/), targeting **RISC-V RV32IM** augmented with two custom crossbar extensions: **custom-0** (MVM / SLDR / SSTR / CSET) and **custom-1** (XADD / XSUB / XMUL).
 
 **By [Aasheik Saran](https://github.com/AasheikSaran-web)**
 
@@ -18,9 +18,9 @@ Traditional von Neumann architecture suffers from the **memory wall**: data must
 
 ### The Memristor Crossbar
 
-A memristor is a two-terminal device whose resistance (and therefore conductance) depends on the history of current that has passed through it. It can be programmed to hold an analog value — making it ideal as a synaptic weight.
+A memristor is a two-terminal device whose conductance depends on the history of current through it. Programmed via voltage pulses, it can hold an analog value — making it ideal as both a weight and a compute element.
 
-Arranged in a **crossbar array**, memristors enable matrix-vector multiplication in a single analog step:
+Arranged in a **64×64 crossbar array**, memristors enable matrix-vector multiplication in a single analog step:
 
 ```
          Input voltages V₀  V₁  V₂  …  Vₙ
@@ -32,15 +32,55 @@ Row 2 ───┤  G₂₀  G₂₁  G₂₂     G₂ₙ  ├── I₂
   …      │                           │    …
 Row m ───┤  Gₘ₀  Gₘ₁  Gₘ₂     Gₘₙ  ├── Iₘ
           └──────────────────────────────────┘
-                                          Output currents
-                                    (Kirchhoff's current law)
+                                     Output currents
+                               (Kirchhoff's current law)
 ```
 
-By Kirchhoff's current law, the output current at each row wire is the **dot product** of the input voltage vector and the memristor conductance row. The entire **matrix-vector multiply** completes in a single analog step — O(1) time, regardless of matrix size — at a fraction of the energy of digital computation.
+The entire **matrix-vector multiply** — O(N²) scalar operations — completes in a **single analog step** regardless of matrix size.
+
+### Physical Memristor Model
+
+This compiler integrates the device model from:
+
+> **"Linear symmetric self-selecting 14-bit kinetic molecular memristors"**  
+> *Nature* **633**, Sep 2024 — [RuIIL](BF₄)₂ on a 64×64 crossbar
+
+| Parameter | Value |
+|-----------|-------|
+| Conductance range | 200 nS – 5.9 mS (G_MIN – G_MAX) |
+| Analog levels | 16,520 (≈14-bit resolution) |
+| G step | ≈ 0.357 µS/level |
+| Potentiation pulse | 900 mV / 80 ns |
+| Depression pulse | −750 mV / 65 ns |
+| Write threshold | 830 mV |
+| Read voltage | ≤ 500 mV (non-disturbing) |
+| Half-select voltage | 450 mV (below V_th, no switching) |
+| Write accuracy (RMSE) | < 42 nS |
+| Signal-to-noise ratio | 73–79 dB |
+
+### Register File Backed by Memristors
+
+Every RISC-V register write (`ADD`, `LW`, `ADDI`, etc.) **internally programs a memristor cell**:
+
+```
+RISC-V:   t0 = a[i]   (LW t0, 0(t1))
+                │
+                ▼  [pot/dep pulses @ 900mV/80ns or 750mV/65ns]
+         crossbar[5][0] = G(value)     ← row 5 = x5 (t0), col 0 = register file
+```
+
+- **Column 0** — register file backing (rows 0–31 store conductance encoding of x0–x31)
+- **Columns 1–63** — weight matrix for MVM operations
+- **Column 62** — scratch region for XADD / XSUB / XMUL (rows 32–40)
+
+The visualizer shows every register write as a pot/dep pulse event, with the resulting conductance in µS.
 
 ### Why RISC-V?
 
-RISC-V is an open, royalty-free ISA designed for extensibility. Its **custom opcode space** (custom-0 through custom-3) lets hardware architects add domain-specific instructions without breaking standard toolchains. This compiler uses **custom-0 (opcode `0x0B`)** for memristor crossbar dispatch instructions, showing exactly how a real IMC accelerator would extend a RISC-V core.
+RISC-V is an open, royalty-free ISA with a reserved **custom opcode space** (custom-0 through custom-3) for domain-specific extensions. This compiler uses:
+
+- **custom-0 (`0x0B`)** — crossbar matrix/memory operations (MVM, SLDR, SSTR, CSET)
+- **custom-1 (`0x2B`)** — crossbar integer arithmetic (XADD, XSUB, XMUL)
 
 ---
 
@@ -51,80 +91,46 @@ RISC-V is an open, royalty-free ISA designed for extensibility. Its **custom opc
             │
             ▼
    ┌──────────────────┐
-   │  Lexer + Parser  │   Tokenizes source, builds AST via recursive
-   └────────┬─────────┘   descent; recognizes mvm() crossbar calls
+   │  Lexer + Parser  │   Tokenizes source, builds AST via recursive descent.
+   └────────┬─────────┘   Recognizes mvm(), cset(), xadd(), xsub(), xmul().
             │
             ▼
    ┌──────────────────┐
-   │  RISC-V IMC      │   Walks AST, emits riscv-imc dialect ops;
-   │  IR Generation   │   maps pointer params to 64-byte memory regions
+   │  RISC-V IMC      │   Walks AST, emits riscv-imc dialect ops.
+   │  IR Generation   │   Maps pointer params to 64-byte memory regions.
    └────────┬─────────┘
             │
             ▼
    ┌──────────────────┐
    │  Optimization    │   Constant propagation, register reuse,
-   │  Passes          │   dead-code elimination
+   │  Passes          │   dead-code elimination.
    └────────┬─────────┘
             │
             ▼
    ┌──────────────────┐
    │  Register Alloc  │   Linear scan over x5–x24 (20 GPRs).
-   └────────┬─────────┘   x25/x26/x27 reserved for tid/bid/bdm
+   └────────┬─────────┘   x25/x26/x27 reserved for tid/bid/bdm.
             │
             ▼
    ┌──────────────────┐
-   │  Binary Emitter  │   Encodes each op into a 32-bit RISC-V word;
-   └────────┬─────────┘   custom-0 words for MVM / SLDR / SSTR
+   │  Binary Emitter  │   Encodes each op into a 32-bit RISC-V word.
+   └────────┬─────────┘   custom-0 and custom-1 words for IMC instructions.
             │
             ▼
     32-bit RISC-V Binary
     (runs on RISC-V core +
-     memristor crossbar IMC)
-```
-
-### Example: Vector Add
-
-```c
-// Source (.tgc)
-kernel vector_add(global int* a, global int* b, global int* c) {
-    int i = blockIdx * blockDim + threadIdx;
-    c[i] = a[i] + b[i];
-}
-```
-
-```
-// RISC-V IMC IR (riscv-imc dialect)
-riscv-imc.func @vector_add() {
-  %0 = riscv.block_id          // bid  = x26
-  %1 = riscv.block_dim         // bdm  = x27
-  %2 = riscv.mul %0, %1        // MUL  t0, bid, bdm
-  %3 = riscv.thread_id         // tid  = x25
-  %4 = riscv.add %2, %3        // ADD  t0, t0, tid
-  %5 = riscv.lw [%4]           // LW   t1, 0(t0)    ; a[i]
-  ...
-  riscv.ecall                  // ECALL             ; thread complete
-}
-```
-
-```asm
-; 32-bit RISC-V assembly output
-0x00000013  ADDI t0, x0, 0          ; i = 0
-0x01B28233  MUL  t0, s10, s11       ; i = blockIdx * blockDim
-0x01928233  ADD  t0, t0, s9         ; i += threadIdx
-0x00028283  LW   t1, 0(t0)          ; t1 = a[i]
-...
-0x00000073  ECALL                   ; thread done
+     64×64 memristor crossbar)
 ```
 
 ---
 
 ## RISC-V ISA
 
-This compiler targets **RISC-V RV32IM** — the 32-bit base integer ISA plus the integer Multiply/Divide extension — augmented with a custom memristor crossbar extension in the **custom-0** opcode space.
+This compiler targets **RISC-V RV32IM** augmented with two custom memristor crossbar extensions.
 
 ### Instruction Formats (32-bit)
 
-All RISC-V instructions are exactly 32 bits wide. There are six canonical formats:
+All RISC-V instructions are exactly 32 bits wide:
 
 ```
 R-type  [31:25 funct7][24:20 rs2][19:15 rs1][14:12 funct3][11:7 rd][6:0 opcode]
@@ -141,103 +147,156 @@ J-type  [31 imm[20]][30:21 imm[10:1]][20 imm[11]][19:12 imm[19:12]][11:7 rd][6:0
 |--------|--------|----------|-----------|
 | `0110011` | R | **ADD** rd, rs1, rs2 | rd = rs1 + rs2 |
 | `0110011` | R | **SUB** rd, rs1, rs2 | rd = rs1 − rs2 (funct7=0x20) |
-| `0110011` | R | **MUL** rd, rs1, rs2 | rd = rs1 × rs2 (funct7=0x01, M-ext) |
-| `0110011` | R | **DIV** rd, rs1, rs2 | rd = rs1 ÷ rs2 (funct7=0x01, M-ext) |
-| `0010011` | I | **ADDI** rd, rs1, imm | rd = rs1 + imm (load immediate) |
-| `0000011` | I | **LW** rd, imm(rs1) | rd = mem[rs1 + imm] (global load) |
-| `0100011` | S | **SW** rs2, imm(rs1) | mem[rs1 + imm] = rs2 (global store) |
-| `1100011` | B | **BEQ** rs1, rs2, off | if rs1 == rs2: PC += off |
-| `1100011` | B | **BNE** rs1, rs2, off | if rs1 != rs2: PC += off |
-| `1100011` | B | **BLT** rs1, rs2, off | if rs1 < rs2: PC += off (signed) |
-| `1100011` | B | **BGE** rs1, rs2, off | if rs1 ≥ rs2: PC += off (signed) |
-| `1101111` | J | **JAL** rd, off | rd = PC+4; PC += off (unconditional jump) |
-| `0110111` | U | **LUI** rd, imm | rd = imm << 12 (load upper immediate) |
-| `0001111` | — | **FENCE** | Memory/thread barrier (`__syncthreads`) |
-| `1110011` | — | **ECALL** | System call — signals thread completion |
+| `0110011` | R | **MUL** rd, rs1, rs2 | rd = rs1 × rs2 (M-ext, funct7=0x01) |
+| `0110011` | R | **DIV** rd, rs1, rs2 | rd = rs1 ÷ rs2 (M-ext, funct7=0x01) |
+| `0010011` | I | **ADDI** rd, rs1, imm | rd = rs1 + imm |
+| `0000011` | I | **LW** rd, imm(rs1) | rd = mem[rs1 + imm] |
+| `0100011` | S | **SW** rs2, imm(rs1) | mem[rs1 + imm] = rs2 |
+| `1100011` | B | **BEQ/BNE/BLT/BGE** | conditional branches |
+| `1101111` | J | **JAL** rd, off | rd = PC+4; PC += off |
+| `0110111` | U | **LUI** rd, imm | rd = imm << 12 |
+| `0001111` | — | **FENCE** | Thread barrier (`__syncthreads`) |
+| `1110011` | — | **ECALL** | Thread completion |
 
-### Custom Memristor Crossbar Extension (custom-0, opcode `0x0B`)
+### Custom-0: Crossbar Matrix/Memory Extension (opcode `0x0B`)
 
-The crossbar instructions occupy RISC-V's custom-0 opcode space, using `funct3` to distinguish operations:
+The `custom-0` opcode is part of RISC-V's reserved custom space. This compiler uses `funct3` to dispatch four crossbar operations:
 
-| funct3 | Mnemonic | Operation |
-|--------|----------|-----------|
-| `000` | **MVM** rd, rs1 | Crossbar matrix-vector multiply. Reads 16-element input vector from `mem[rs1]`, multiplies by the 16×16 conductance matrix, writes 16-element result to `mem[rd]`. Single analog step ≈ 1 cycle. |
-| `001` | **SLDR** rd, rs1 | Scratchpad (shared) memory load: `rd = scratchpad[rs1]` |
-| `010` | **SSTR** rs1, rs2 | Scratchpad (shared) memory store: `scratchpad[rs1] = rs2` |
+| funct3 | Mnemonic | Operation | Physical Mechanism |
+|--------|----------|-----------|-------------------|
+| `000` | **MVM** rd, rs1 | Analog 16×16 matrix-vector multiply. Reads input from `mem[rs1]`, writes result to `mem[rd]`. ≈1 cycle. | Kirchhoff's current law: I_Q = Σ_P V_P·G_{P,Q} |
+| `001` | **SLDR** rd, rs1 | Scratchpad load: `rd = scratch[rs1]` | Low-latency SRAM-like access |
+| `010` | **SSTR** rs1, rs2 | Scratchpad store: `scratch[rs1] = rs2` | Low-latency SRAM-like access |
+| `011` | **CSET** rd, rs1, rs2 | Program crossbar cell: `crossbar[rs1][rs2] = conductance(rd)` | Pot/dep pulse sequence to target conductance |
 
-**MVM binary encoding (R-type layout, custom-0):**
+**Binary encoding (R-type, custom-0):**
 ```
   31      25 24   20 19   15 14  12 11    7 6      0
  ┌──────────┬───────┬───────┬──────┬───────┬────────┐
- │ 0000000  │ 00000 │  rs1  │ 000  │  rd   │0001011 │
+ │ funct7   │  rs2  │  rs1  │funct3│  rd   │0001011 │
  └──────────┴───────┴───────┴──────┴───────┴────────┘
-   funct7     rs2    rs1   funct3    rd     opcode
+```
+
+### Custom-1: Crossbar Integer Arithmetic Extension (opcode `0x2B`)
+
+The `custom-1` opcode (`0101011` in binary) is unused in standard RISC-V and allocated here for **crossbar-native integer arithmetic**. These instructions route operands through dedicated memristor scratch cells (column 62, rows 32–40) and exploit the physics of the device to perform the computation in the analog domain.
+
+| funct3 | Mnemonic | Operation | Physical Mechanism | Scratch Rows (col 62) |
+|--------|----------|-----------|-------------------|-----------------------|
+| `000` | **XADD** rd, rs1, rs2 | rd = rs1 + rs2 | Conductance superposition: G_R = G(A) + G(B) − G_MIN | A=32, B=33, R=34 |
+| `001` | **XSUB** rd, rs1, rs2 | rd = rs1 − rs2 | Differential pair: G_R = G(A) − G(B) + G_MIN | A=35, B=36, R=37 |
+| `010` | **XMUL** rd, rs1, rs2 | rd = rs1 × rs2 | Ohm's law: I = V(A) · G(B), then sense current | V=38, G=39, R=40 |
+
+**Binary encoding (R-type, custom-1):**
+```
+  31      25 24   20 19   15 14  12 11    7 6      0
+ ┌──────────┬───────┬───────┬──────┬───────┬────────┐
+ │ 0000000  │  rs2  │  rs1  │funct3│  rd   │0101011 │
+ └──────────┴───────┴───────┴──────┴───────┴────────┘
+```
+
+**Physical detail for each operation:**
+
+```
+XADD — Conductance superposition at bit-line
+  Step 1: G[32][62] = G_MIN + A/255 × (G_MAX − G_MIN)   ← program cell A
+  Step 2: G[33][62] = G_MIN + B/255 × (G_MAX − G_MIN)   ← program cell B
+  Step 3: G_R = G[32][62] + G[33][62] − G_MIN            ← bit-line reads both
+       →  result = (G_R − G_MIN) / (G_MAX − G_MIN) × 255 = A + B  ✓
+
+XSUB — Differential conductance pair
+  Step 1: G[35][62] = G(A)     ← positive cell
+  Step 2: G[36][62] = G(B)     ← negative cell
+  Step 3: G_R = G(A) − G(B) + G_MIN  ← differential read
+       →  result = A − B  (clamps to 0 for unsigned underflow)
+
+XMUL — Ohm's law: I = V × G
+  Step 1: G[38][62] = G(A)     ← voltage-control cell (V = A/255 × V_READ)
+  Step 2: G[39][62] = G(B)     ← conductance-weight cell
+  Step 3: I_µA = (A/255 × V_READ) × G(B)   ← current sense
+       →  result = round(I / I_MAX × 255²)  (analog output shown in visualizer)
+       →  rd = A × B  (exact RISC-V integer semantics preserved)
 ```
 
 ### Register File (x0–x31, RISC-V ABI)
 
-| Registers | ABI Name | Role in this compiler |
-|-----------|----------|-----------------------|
-| x0 | `zero` | Hardwired 0 — used for immediate loads via ADDI |
+| Registers | ABI Name | Role |
+|-----------|----------|------|
+| x0 | `zero` | Hardwired 0 |
 | x5–x7 | `t0–t2` | Allocatable temporaries |
 | x8–x9 | `s0–s1` | Allocatable saved registers |
 | x10–x17 | `a0–a7` | Allocatable argument/result registers |
 | x18–x24 | `s2–s8` | Allocatable saved registers |
-| x25 | `s9` / `tid` | **threadIdx** — thread index within block (read-only) |
-| x26 | `s10` / `bid` | **blockIdx** — current block index (read-only) |
-| x27 | `s11` / `bdm` | **blockDim** — threads per block (read-only) |
+| x25 | `tid` | **threadIdx** — thread index within block |
+| x26 | `bid` | **blockIdx** — current block index |
+| x27 | `bdm` | **blockDim** — threads per block |
 | x28–x31 | `t3–t6` | Reserved |
 
-The linear scan allocator manages **20 general-purpose registers** (x5–x24).
+Linear scan allocates **20 GPRs** (x5–x24). Every write to x0–x31 **also programs crossbar col 0, row = register number** via pot/dep pulses.
 
 ---
 
-## Memristor Crossbar Hardware
-
-### Physical Model
-
-Each memristor in the crossbar is a two-terminal resistive device characterized by its **conductance** G (in units normalised to 0–255 in the simulator). The crossbar implements:
+## Crossbar Physical Layout (64×64)
 
 ```
-I_row = Σ_col ( G[row][col] × V_col )
+         col 0      col 1 … col 16    col 17 … col 61   col 62     col 63
+         (REG FILE) (MVM WEIGHTS  )   (unused       )   (XA SCRATCH) …
+
+row 0    x0 reg     W[0][1]…W[0][16]  —                 —           —
+row 1    x1 reg     W[1][1]…W[1][16]  —                 —           —
+…        …          …                 —                 —           —
+row 31   x31 reg    W[31][1]          —                 —           —
+row 32   —          —                 —                 XADD.A      —
+row 33   —          —                 —                 XADD.B      —
+row 34   —          —                 —                 XADD.R      —
+row 35   —          —                 —                 XSUB.A      —
+row 36   —          —                 —                 XSUB.B      —
+row 37   —          —                 —                 XSUB.R      —
+row 38   —          —                 —                 XMUL.V      —
+row 39   —          —                 —                 XMUL.G      —
+row 40   —          —                 —                 XMUL.R      —
+…        —          —                 —                 —           —
+row 63   —          —                 —                 —           —
 ```
 
-where:
-- **V_col** — input voltage applied to column wire (proportional to input data)
-- **G[row][col]** — conductance of the memristor at position (row, col), programmed as a weight
-- **I_row** — output current on row wire (read by ADC, proportional to dot product result)
+---
 
-This is physically equivalent to a **matrix-vector multiply** performed in the analog domain by Kirchhoff's current law — no separate compute unit needed.
+## Performance Comparison
 
-### Crossbar Simulator (16×16)
+| Operation | Standard RISC-V (digital) | Crossbar IMC (analog) | Speedup |
+|-----------|--------------------------|----------------------|---------|
+| 16×16 MatVec (MVM) | 256 MUL + 255 ADD ≈ 511 ops, ~2560 cycles | 1 MVM ≈ **1 cycle** | **~2560×** |
+| Integer ADD (XADD) | 1 ADD, 5 pipeline cycles | 1 XADD ≈ **2 cycles** | ~2.5× |
+| Integer SUB (XSUB) | 1 SUB, 5 pipeline cycles | 1 XSUB ≈ **2 cycles** | ~2.5× |
+| Integer MUL (XMUL) | 1 MUL, ~10 cycles (multi-cycle) | 1 XMUL ≈ **3 cycles** | ~3.3× |
+| Register write | Register file write | Reg write + crossbar pot/dep | +∆t for crossbar |
 
-The simulator models a 16×16 memristor crossbar:
-
-```
-Crossbar state: G[16][16]   (conductance values, 0–255)
-MVM operation:
-  for row in 0..15:
-    I[row] = Σ_col(G[row][col] × mem[srcAddr + col]) >> 8
-  mem[dstAddr .. dstAddr+15] = I[0..15]
-```
-
-The `>> 8` normalises the accumulated product to 8-bit range. The crossbar conductance grid is visualised live in the simulator panel.
-
-### Performance Advantage
-
-| Operation | Scalar RISC-V (digital) | Crossbar MVM (analog IMC) |
-|-----------|-------------------------|--------------------------|
-| 16×16 MatVec | 256 MUL + 255 ADD = 511 ops | **1 MVM** (single analog step) |
-| Estimated cycles | ~2560 (5-stage pipeline) | **~1 cycle** |
-| Energy model | O(N²) operations | O(1) operations |
-
-Each `MVM` instruction in this compiler saves approximately **511 scalar MACs** — shown live in the Analysis panel.
+The main advantage of XADD/XSUB/XMUL over standard ALU ops is **energy**: the analog computation avoids full-swing digital switching across all bits, and the result is available from a single current sense.
 
 ---
 
 ## The DSL
 
-A minimal C-like language for expressing parallel kernels, with a crossbar extension:
+A minimal C-like language extended with crossbar instructions:
+
+### Keywords
+
+| Keyword | Type | Syntax | Compiles To |
+|---------|------|--------|-------------|
+| `kernel` | declaration | `kernel name(params) { }` | Function entry |
+| `global` | param qualifier | `global int* ptr` | Pointer to 64-byte memory region |
+| `shared` | storage | `shared int arr[N]` | Scratchpad allocation |
+| `__syncthreads()` | barrier | `__syncthreads();` | `FENCE` instruction |
+| `mvm()` | crossbar MVM | `mvm(out, in)` | `MVM` (custom-0, funct3=0) |
+| `cset()` | crossbar write | `cset(row, col, val)` | `CSET` (custom-0, funct3=3) |
+| `xadd()` | crossbar add | `xadd(dest, a, b)` | `XADD` (custom-1, funct3=0) |
+| `xsub()` | crossbar sub | `xsub(dest, a, b)` | `XSUB` (custom-1, funct3=1) |
+| `xmul()` | crossbar mul | `xmul(dest, a, b)` | `XMUL` (custom-1, funct3=2) |
+| `threadIdx` | builtin | expression | `x25` register |
+| `blockIdx` | builtin | expression | `x26` register |
+| `blockDim` | builtin | expression | `x27` register |
+
+### Examples
 
 ```c
 // Standard parallel kernel
@@ -248,15 +307,36 @@ kernel vector_add(global int* a, global int* b, global int* c) {
 ```
 
 ```c
-// In-Memory Compute kernel using crossbar MVM
-kernel matmul_imc(global int* input, global int* output) {
-    // Crossbar performs the full 16x16 matrix-vector multiply in one step
-    mvm(output, input);
+// Crossbar MVM: each thread programs a weight row, then runs analog matmul
+kernel crossbar_mvm(global int* weights, global int* input, global int* output) {
+    int tid = threadIdx;
+    int w = weights[tid];
+    cset(tid, 1, w);       // program crossbar[tid][1] = G(w) via pot/dep pulses
+    __syncthreads();
+    if (tid < 1) {
+        mvm(output, input); // I_Q = Σ_P V_P · G_{P,Q} in single analog step
+    }
 }
 ```
 
 ```c
-// Scratchpad memory with barrier synchronization
+// Crossbar arithmetic: XADD / XSUB / XMUL via custom-1 opcode
+kernel crossbar_arith(global int* a, global int* b, global int* out) {
+    int idx = blockIdx * blockDim + threadIdx;
+    int ai = a[idx];
+    int bi = b[idx];
+    int s = 0;
+    int d = 0;
+    int p = 0;
+    xadd(s, ai, bi);   // XADD: conductance superposition  G(A)+G(B)−G_MIN
+    xsub(d, ai, bi);   // XSUB: differential pair          G(A)−G(B)+G_MIN
+    xmul(p, ai, bi);   // XMUL: Ohm's law                  I = V(A)·G(B)
+    out[idx] = s;
+}
+```
+
+```c
+// Shared memory with barrier synchronization
 kernel shared_reduce(global int* input, global int* output) {
     shared int scratch[4];
     int idx = blockIdx * blockDim + threadIdx;
@@ -272,150 +352,44 @@ kernel shared_reduce(global int* input, global int* output) {
 }
 ```
 
-### Language Reference
+---
 
-| Feature | Syntax | Compiled To |
-|---------|--------|-------------|
-| Kernel declaration | `kernel name(params) { }` | Function entry point |
-| Global pointer | `global int* name` | Memory region base address |
-| Scalar parameter | `int name` | Loaded from address 192+ |
-| Thread index | `threadIdx` | x25 (s9/tid) |
-| Block index | `blockIdx` | x26 (s10/bid) |
-| Threads per block | `blockDim` | x27 (s11/bdm) |
-| Arithmetic | `+`, `-`, `*`, `/` | ADD/SUB/MUL/DIV |
-| Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` | BEQ/BNE/BLT/BGE |
-| For loop | `for (int i = 0; i < n; i = i + 1)` | Branch + JAL |
-| Conditional | `if (cond) { } else { }` | BEQ/BNE/BLT/BGE |
-| Global load | `a[i]` | LW rd, 0(rs1) |
-| Global store | `a[i] = v` | SW rs2, 0(rs1) |
-| Scratchpad array | `shared int arr[size]` | Scratchpad allocation |
-| Scratchpad load | `arr[i]` (on shared array) | SLDR rd, rs1 (custom-0) |
-| Scratchpad store | `arr[i] = v` | SSTR rs1, rs2 (custom-0) |
-| Thread barrier | `__syncthreads()` | FENCE |
-| **Crossbar MVM** | `mvm(output, input)` | **MVM rd, rs1 (custom-0)** |
+## Visualizer Panels
 
-### Memory Layout
+### Left: Source Code Editor
+Live-editable `.tgc` kernel source. Recompiles with 300ms debounce.
 
-| Memory Type | Size | Latency | Scope |
-|-------------|------|---------|-------|
-| **Global** (DRAM) | 256 bytes | High (~4 cycles) | All blocks |
-| **Scratchpad** (SRAM) | 64 bytes per block | Low (~1 cycle) | Single block |
-| **Crossbar** (analog) | 16×16 conductances | **~1 cycle** for full MatVec | Shared |
+### Center: Compilation Pipeline
+Three IR stages shown side-by-side:
+1. **RISC-V IMC Dialect** — SSA form with `riscv.xadd`, `riscv.cset`, `riscv.mvm` etc.
+2. **Optimization Passes** — constant propagation, register reuse, dead-code elimination
+3. **Register Allocation** — physical x5–x24 assignments
 
-Pointer parameters map to contiguous 64-byte regions in global memory:
+Below: **32-bit Binary View** — color-coded by field (opcode red, rd blue, funct3 yellow, rs1 green, imm/rs2 orange).
 
-| Parameter order | Address range |
-|-----------------|--------------|
-| 1st `global int*` | 0–63 |
-| 2nd `global int*` | 64–127 |
-| 3rd `global int*` | 128–191 |
-| Scalar `int` | 192+ |
+### Right: IMC Execution + Analysis
+
+**IMC Execution tab:**
+- Thread cards showing pipeline stage, PC, and register values
+- **Register File Crossbar Panel** (col 0) — all 32 registers with conductance in µS
+- **Weight Matrix Heatmap** (cols 1–8, rows 0–7) — heat-map of programmed MVM weights
+- **Crossbar Arithmetic Panel** — XADD/XSUB/XMUL scratch cells (col 62) with conductance bars and physics formulas, activated when custom-1 instructions execute
+- **Memristor Write Log** — recent pot/dep pulse events: cell address, ΔG, pulse count
+
+**Analysis tab:**
+- IMC Performance Score (memory efficiency, branch uniformity, register pressure, crossbar utilization)
+- Metrics grid: instructions, registers, compute/memory ops, MVM/CSET/XADD+XSUB+XMUL counts
+- Thread divergence analysis
+- Memory access coalescence patterns
+- Workload balance (IMC vs Compute vs Memory)
+- Estimated cycle count
 
 ---
 
-## Web Visualizer Features
+## Built With
 
-| Panel | What It Shows |
-|-------|---------------|
-| **Source Editor** | Monaco editor with live compilation (300ms debounce) |
-| **RISC-V IMC Pipeline** | Three compilation stages: IR generation → optimization → register allocation |
-| **32-bit Binary** | Color-coded instruction fields: imm/rs2 · rs1 · funct3 · rd · opcode |
-| **IMC Execution** | Cycle-by-cycle RISC-V + crossbar simulation; thread cards show 5-stage pipeline state |
-| **Crossbar Grid** | Live 8×8 heatmap of memristor conductances; last MVM output vector |
-| **Analysis** | Divergence, memory access patterns, crossbar utilization, cycles saved vs. scalar |
-
-### Running the Visualizer
-
-```bash
-git clone https://github.com/AasheikSaran-web/risc-v-imc-compiler
-cd risc-v-imc-compiler/web
-npm install
-npm run dev
-# Open http://localhost:5173
-```
-
----
-
-## Examples
-
-| Kernel | Description | Highlights |
-|--------|-------------|------------|
-| `vector_add` | `c[i] = a[i] + b[i]` | Basic RISC-V parallel kernel |
-| `matrix_multiply` | Loop-based matmul | For-loops, register pressure |
-| `dot_product` | `Σ a[i]·b[i]` | Multiply-accumulate pattern |
-| `saxpy` | `y[i] = α·x[i] + y[i]` | Scalar parameter loading |
-| `relu` | `max(0, x[i])` | Branch divergence analysis |
-| `shared_reduce` | Parallel tree reduction | Scratchpad + FENCE barrier |
-| `shared_tile_add` | Tiled addition | Scratchpad tiling pattern |
-| `conv1d` | 1D sliding window | Nested loops, accumulation |
-| `vector_max` | `max(a[i], b[i])` | Divergent branches |
-
----
-
-## Project Structure
-
-```
-risc-v-imc-compiler/
-  web/
-    src/
-      compiler/
-        TGCCompiler.ts     # RISC-V IMC compiler (Lexer → Parser → IR → RegAlloc → Binary)
-        types.ts           # Shared types: Instruction, CrossbarState, SimulationState, …
-      simulator/
-        TinyGPUSim.ts      # RISC-V + memristor crossbar cycle-accurate simulator
-      components/
-        Editor.tsx         # Monaco source editor
-        PipelineView.tsx   # Compilation stage viewer
-        BinaryView.tsx     # 32-bit RISC-V binary with field color-coding
-        GPUSimulator.tsx   # IMC execution panel + crossbar grid + register file
-        AnalysisPanel.tsx  # Divergence, coalescing, IMC efficiency analysis
-      examples/index.ts    # Pre-loaded example kernels
-  include/                 # C++ MLIR dialect headers (TinyGPU dialect, original)
-  lib/                     # C++ MLIR dialect implementations
-  tools/tgc/               # Command-line compiler driver
-  examples/                # .tgc source kernels
-  Dockerfile               # Reproducible LLVM/MLIR build
-```
-
----
-
-## How This Relates to Real IMC Compilers
-
-| Concept | This Project | Production IMC (e.g., IBM AIHWKit, Analog AI) |
-|---------|--------------|-----------------------------------------------|
-| **IR** | RISC-V IMC dialect (MLIR) | ONNX / Torch FX → hardware IR |
-| **Crossbar dispatch** | custom-0 MVM instruction | Proprietary crossbar API |
-| **Weight mapping** | Identity/demo conductances | Quantization-aware training |
-| **ADC/DAC model** | 8-bit normalization (>>8) | Full ADC non-linearity model |
-| **Register allocation** | Linear scan, 20 GPRs | LLVM allocator with spill |
-| **Tile size** | Fixed 16×16 | Variable (128×128 – 1K×1K) |
-| **Noise model** | None (ideal) | Shot noise, conductance drift |
-| **Memory hierarchy** | Global + scratchpad | HBM + SRAM tile buffers |
-
-The fundamental idea — lowering matrix operations to analog crossbar dispatch — is identical. The simplifications make each step teachable without losing the essential architecture.
-
----
-
-## Roadmap
-
-- [x] RISC-V RV32IM backend (32-bit instruction encoding)
-- [x] Memristor crossbar custom-0 extension (MVM / SLDR / SSTR)
-- [x] RISC-V ABI register allocation (x5–x24)
-- [x] 5-stage RISC-V pipeline simulator
-- [x] 16×16 crossbar simulation with Kirchhoff model
-- [x] `mvm()` DSL keyword for crossbar dispatch
-- [x] Scratchpad memory + `__syncthreads()` (FENCE)
-- [x] Thread divergence and memory coalescing analysis
-- [x] Crossbar conductance heatmap visualization
-- [x] IMC efficiency metrics (cycles saved vs. scalar)
-- [ ] Conductance noise model (shot noise, retention drift)
-- [ ] Weight quantization pass (map float weights to 8-bit conductances)
-- [ ] Variable crossbar tile size (configurable N×N)
-- [ ] WASM backend (run C++ MLIR compiler in browser)
-- [ ] Hardware RTL generation (RISC-V core + crossbar controller in CIRCT)
-
----
-
-## License
-
-Apache 2.0 with LLVM Exceptions. See [LICENSE](LICENSE).
+- **TypeScript + React** — all compiler and simulator logic runs in-browser
+- **Vite** — build tooling
+- **MLIR dialect naming conventions** — IR stages follow `riscv-imc.func` notation
+- **RISC-V specification** — RV32IM base + custom-0/custom-1 extensions
+- **Physical model** — Nature 633, Sep 2024 (molecular memristor device parameters)

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { TinyGPUSim } from '../simulator/TinyGPUSim';
 import {
   Instruction, SimulationState, PipelineStage, CrossbarState,
-  MEMRISTOR_PHYSICS, MemristorWriteEvent,
+  MEMRISTOR_PHYSICS, MemristorWriteEvent, XA_SCRATCH,
 } from '../compiler/types';
 
 interface IMCSimulatorProps {
@@ -382,10 +382,138 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
         </div>
       </div>
 
+      {/* ── Scratch arithmetic panel (custom-1 XADD/XSUB/XMUL) ── */}
+      <ScratchArithmetic crossbar={crossbar} />
+
       {/* ── Write event log ── */}
       {crossbar.writeEvents.length > 0 && (
         <WriteEventLog events={crossbar.writeEvents} />
       )}
+    </div>
+  );
+}
+
+// ── Scratch arithmetic visualization (custom-1 col 62) ───────────────────
+
+const XA_OPS = [
+  {
+    label: 'XADD', color: '#98c379', opcode: '0x2B/f3=0',
+    rowA: XA_SCRATCH.XADD_ROW_A, rowB: XA_SCRATCH.XADD_ROW_B, rowR: XA_SCRATCH.XADD_ROW_R,
+    physDesc: 'G(A) + G(B) − G_MIN',
+    mechanism: 'Conductance superposition at bit-line',
+  },
+  {
+    label: 'XSUB', color: '#e06c75', opcode: '0x2B/f3=1',
+    rowA: XA_SCRATCH.XSUB_ROW_A, rowB: XA_SCRATCH.XSUB_ROW_B, rowR: XA_SCRATCH.XSUB_ROW_R,
+    physDesc: 'G(A) − G(B) + G_MIN',
+    mechanism: 'Differential conductance pair',
+  },
+  {
+    label: 'XMUL', color: '#d19a66', opcode: '0x2B/f3=2',
+    rowA: XA_SCRATCH.XMUL_ROW_V, rowB: XA_SCRATCH.XMUL_ROW_G, rowR: XA_SCRATCH.XMUL_ROW_R,
+    physDesc: 'I = V(A) · G(B)',
+    mechanism: "Ohm's law: voltage × conductance",
+  },
+] as const;
+
+function ScratchArithmetic({ crossbar }: { crossbar: CrossbarState }) {
+  const col  = XA_SCRATCH.COL;
+  const gRange = G_MAX_US - G_MIN_US;
+  const norm   = (g: number) => Math.max(0, Math.min(1, (g - G_MIN_US) / gRange));
+  const gToVal = (g: number) => Math.round(norm(g) * 255);
+
+  // Check if any scratch cell has been written (above G_MIN)
+  const anyActive = XA_OPS.some(({ rowA, rowB, rowR }) =>
+    [rowA, rowB, rowR].some((r) => {
+      const g = crossbar.conductances[r]?.[col] ?? G_MIN_US;
+      return g > G_MIN_US + MEMRISTOR_PHYSICS.G_STEP_US;
+    })
+  );
+
+  return (
+    <div style={{ marginTop: '8px' }}>
+      <div style={{ fontSize: '10px', color: '#888', fontWeight: 600, marginBottom: '4px',
+        display: 'flex', alignItems: 'center', gap: '6px' }}>
+        Crossbar Arithmetic (custom-1 · col 62)
+        {!anyActive && (
+          <span style={{ color: '#444', fontWeight: 400 }}>
+            — use xadd/xsub/xmul() in kernel to activate
+          </span>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+        {XA_OPS.map(({ label, color, opcode, rowA, rowB, rowR, physDesc, mechanism }) => {
+          const G_A = crossbar.conductances[rowA]?.[col] ?? G_MIN_US;
+          const G_B = crossbar.conductances[rowB]?.[col] ?? G_MIN_US;
+          const G_R = crossbar.conductances[rowR]?.[col] ?? G_MIN_US;
+          const vA  = gToVal(G_A), vB = gToVal(G_B), vR = gToVal(G_R);
+          const nA  = norm(G_A), nB = norm(G_B), nR = norm(G_R);
+          const isActive = G_A > G_MIN_US + MEMRISTOR_PHYSICS.G_STEP_US ||
+                           G_B > G_MIN_US + MEMRISTOR_PHYSICS.G_STEP_US;
+
+          return (
+            <div key={label} style={{
+              flex: '1 1 140px', padding: '6px', borderRadius: '4px',
+              background: isActive ? '#1a1a1a' : '#111',
+              border: `1px solid ${isActive ? color + '44' : '#1a1a2e'}`,
+            }}>
+              {/* Header */}
+              <div style={{ display: 'flex', justifyContent: 'space-between',
+                marginBottom: '5px', alignItems: 'center' }}>
+                <span style={{ color, fontSize: '10px', fontWeight: 700 }}>{label}</span>
+                <span style={{ color: '#444', fontSize: '8px', fontFamily: 'monospace' }}>{opcode}</span>
+              </div>
+
+              {/* Operand cells: A, B, Result */}
+              {(['A', 'B', 'R'] as const).map((role, idx) => {
+                const row  = idx === 0 ? rowA : idx === 1 ? rowB : rowR;
+                const G    = idx === 0 ? G_A : idx === 1 ? G_B : G_R;
+                const v    = idx === 0 ? vA  : idx === 1 ? vB  : vR;
+                const n    = idx === 0 ? nA  : idx === 1 ? nB  : nR;
+                const cellColor = role === 'R' ? color : '#9cdcfe';
+                const isResult  = role === 'R';
+                return (
+                  <div key={role} style={{ display: 'flex', alignItems: 'center',
+                    gap: '4px', marginBottom: '3px' }}
+                    title={`Row ${row}, col ${col}\nG = ${G.toFixed(1)} µS\nvalue ≈ ${v}`}>
+                    {/* Role badge */}
+                    <span style={{ color: cellColor, fontSize: '8px', width: '10px',
+                      fontWeight: isResult ? 700 : 400 }}>
+                      {role}
+                    </span>
+                    {/* Conductance bar */}
+                    <div style={{ flex: 1, height: '8px', background: '#222',
+                      borderRadius: '3px', overflow: 'hidden',
+                      border: `1px solid ${isResult ? color + '33' : '#333'}` }}>
+                      <div style={{
+                        width: `${Math.max(2, n * 100)}%`, height: '100%',
+                        background: isResult
+                          ? `linear-gradient(to right, ${color}88, ${color})`
+                          : `linear-gradient(to right, #4ec9b044, #4ec9b0)`,
+                        borderRadius: '3px', transition: 'width 0.2s',
+                      }} />
+                    </div>
+                    {/* Value */}
+                    <span style={{ color: isActive ? (isResult ? color : '#b5cea8') : '#444',
+                      fontSize: '9px', fontFamily: 'monospace', width: '24px',
+                      textAlign: 'right' }}>
+                      {isActive ? v : '—'}
+                    </span>
+                  </div>
+                );
+              })}
+
+              {/* Physics formula */}
+              <div style={{ marginTop: '4px', fontSize: '8px', color: isActive ? '#555' : '#333',
+                borderTop: `1px solid ${isActive ? '#2a2a2a' : '#1a1a1a'}`, paddingTop: '3px' }}>
+                <span style={{ color: isActive ? color + 'aa' : '#333' }}>{physDesc}</span>
+                {isActive && <div style={{ color: '#444', marginTop: '1px' }}>{mechanism}</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

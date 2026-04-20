@@ -14,6 +14,7 @@ import { CompilationTrace, Instruction, AnalysisResult, DivergenceInfo, Coalesci
 
 type TokenKind =
   | 'kernel' | 'global' | 'int' | 'for' | 'if' | 'else' | 'shared' | 'mvm' | 'cset'
+  | 'xadd' | 'xsub' | 'xmul'
   | 'threadIdx' | 'blockIdx' | 'blockDim'
   | '__syncthreads'
   | 'ident' | 'number'
@@ -31,7 +32,7 @@ interface Token {
 function lex(source: string): Token[] {
   const tokens: Token[] = [];
   let pos = 0, line = 1, col = 1;
-  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm', 'cset']);
+  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm', 'cset', 'xadd', 'xsub', 'xmul']);
   const builtins = new Set(['threadIdx', 'blockIdx', 'blockDim']);
 
   while (pos < source.length) {
@@ -118,7 +119,10 @@ type Stmt =
   | { type: 'shared_decl'; name: string; size: number }
   | { type: 'syncthreads' }
   | { type: 'mvm'; output: string; input: string }
-  | { type: 'cset'; row: Expr; col: Expr; val: Expr }  // Program crossbar cell
+  | { type: 'cset'; row: Expr; col: Expr; val: Expr }   // Program crossbar cell
+  | { type: 'xadd'; dest: string; a: Expr; b: Expr }    // Crossbar integer add
+  | { type: 'xsub'; dest: string; a: Expr; b: Expr }    // Crossbar integer subtract
+  | { type: 'xmul'; dest: string; a: Expr; b: Expr }    // Crossbar integer multiply
   | { type: 'for'; init: Stmt; cond: Expr; iterVar: string; iterExpr: Expr; body: Stmt[] }
   | { type: 'if'; cond: Expr; then: Stmt[]; else: Stmt[] };
 
@@ -218,6 +222,19 @@ function parse(tokens: Token[]): Kernel {
       expect(')');
       expect(';');
       return { type: 'cset', row, col, val };
+    }
+    // xadd/xsub/xmul(dest, src_a, src_b) — custom-1 crossbar integer arithmetic
+    if (peek().kind === 'xadd' || peek().kind === 'xsub' || peek().kind === 'xmul') {
+      const op = advance().kind as 'xadd' | 'xsub' | 'xmul';
+      expect('(');
+      const dest = expect('ident').text;
+      expect(',');
+      const a = parseExpr();
+      expect(',');
+      const b = parseExpr();
+      expect(')');
+      expect(';');
+      return { type: op, dest, a, b };
     }
     if (peek().kind === 'for') {
       advance(); expect('(');
@@ -405,6 +422,7 @@ interface IRInstruction {
   isSharedMem?: boolean;
   isBarrier?: boolean;
   isMVM?: boolean;
+  isXArith?: boolean;  // XADD / XSUB / XMUL
 }
 
 // Branch info tracked from comparison expressions
@@ -630,6 +648,34 @@ function compile(kernel: Kernel): {
         });
         break;
       }
+      case 'xadd':
+      case 'xsub':
+      case 'xmul': {
+        // Custom-1 crossbar arithmetic: dest = crossbar_op(a, b)
+        // Physical: XADD→conductance superposition, XSUB→differential pair, XMUL→V·G=I
+        const aSSA = genExpr(stmt.a);
+        const bSSA = genExpr(stmt.b);
+        const aReg = regOf(aSSA);
+        const bReg = regOf(bSSA);
+        const destSSA  = nextSSA++;
+        const destReg  = allocReg(destSSA);
+        vars[stmt.dest] = destSSA;
+        const opUpper = stmt.type.toUpperCase();
+        const physDesc = stmt.type === 'xadd'
+          ? `G(${regName(aReg)})+G(${regName(bReg)})−G_MIN → col62`
+          : stmt.type === 'xsub'
+          ? `G(${regName(aReg)})−G(${regName(bReg)})+G_MIN → col62`
+          : `V(${regName(aReg)})·G(${regName(bReg)})=I → col62`;
+        irLines.push(`  %${destSSA} = riscv.${stmt.type} ${regName(aReg)}, ${regName(bReg)}`);
+        irLines.push(`  // crossbar scratch col62: ${physDesc}`);
+        irOps.push({
+          op: opUpper,
+          rd: destReg, rs: aReg, rt: bReg,
+          asm: `${opUpper} ${asmReg(destReg)}, ${asmReg(aReg)}, ${asmReg(bReg)}`,
+          isXArith: true,
+        });
+        break;
+      }
       case 'store': {
         const indexSSA = genExpr(stmt.index);
         const valueSSA = genExpr(stmt.value);
@@ -776,6 +822,10 @@ function compile(kernel: Kernel): {
       case 'SSTR':  binary = encodeR(0x0B, 0,  0x2, rs1, rs2, 0x00); break;
       case 'MVM':   binary = encodeR(0x0B, rd, 0x0, rs1, 0, 0x00); break;
       case 'CSET':  binary = encodeR(0x0B, rd, 0x3, rs1, rs2, 0x00); break;
+      // custom-1 (0x2B) — crossbar integer arithmetic
+      case 'XADD':  binary = encodeR(0x2B, rd, 0x0, rs1, rs2, 0x00); break;
+      case 'XSUB':  binary = encodeR(0x2B, rd, 0x1, rs1, rs2, 0x00); break;
+      case 'XMUL':  binary = encodeR(0x2B, rd, 0x2, rs1, rs2, 0x00); break;
       case 'FENCE': binary = 0x0000100F; break;
       case 'ECALL': binary = 0x00000073; break;
       case 'BEQ':   binary = encodeB(0x63, 0x0, rs1, rs2, (target - i) * 4); break;
@@ -839,6 +889,7 @@ function analyzeCompilation(
   let barrierCount = 0;
   let imcOps = 0;
   let csetOps = 0;
+  let xArithOps = 0;
   let sharedMemBytes = 0;
 
   for (const stmt of kernel.body) {
@@ -922,6 +973,23 @@ function analyzeCompilation(
       });
     }
 
+    if (op.isXArith) {
+      xArithOps++;
+      // XADD/XSUB cost ~2 cycles; XMUL costs ~3 cycles (vs 5/10 for standard pipeline)
+      const cycleHint = op.op === 'XMUL' ? 3 : 2;
+      coalescing.push({
+        instructionAddr: i,
+        accessPattern: 'coalesced',
+        addresses: [],
+        transactionsNeeded: cycleHint,
+        description: op.op === 'XADD'
+          ? `Crossbar XADD: conductance superposition G(A)+G(B)−G_MIN → A+B (≈${cycleHint} cycles, col 62)`
+          : op.op === 'XSUB'
+          ? `Crossbar XSUB: differential pair G(A)−G(B)+G_MIN → A−B (≈${cycleHint} cycles, col 62)`
+          : `Crossbar XMUL: Ohm's law V(A)·G(B)=I → A×B (≈${cycleHint} cycles, col 62)`,
+      });
+    }
+
     if (op.isBarrier) barrierCount++;
     if (['ADD', 'SUB', 'MUL', 'DIV', 'ADDI'].includes(op.op)) computeCount++;
   }
@@ -945,11 +1013,12 @@ function analyzeCompilation(
       computeInstructions: computeCount,
       imcOperations: imcOps,
       crossbarWriteOps: csetOps,
+      crossbarArithOps: xArithOps,
       barrierCount,
       estimatedCycles,
       crossbarCyclesSaved,
       computeToMemoryRatio: Math.round(computeToMemoryRatio * 100) / 100,
-      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} MVM ops` : ''}${csetOps > 0 ? `, ${csetOps} CSET writes` : ''}`,
+      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} MVM ops` : ''}${csetOps > 0 ? `, ${csetOps} CSET writes` : ''}${xArithOps > 0 ? `, ${xArithOps} XA arith` : ''}`,
     },
   };
 }

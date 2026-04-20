@@ -39,6 +39,7 @@ export interface PerformanceMetrics {
   computeInstructions: number;
   imcOperations: number;         // MVM crossbar instructions
   crossbarWriteOps: number;      // CSET instructions
+  crossbarArithOps: number;      // XADD + XSUB + XMUL instructions (custom-1)
   barrierCount: number;
   estimatedCycles: number;
   crossbarCyclesSaved: number;   // Cycles saved vs scalar multiply-accumulate
@@ -114,7 +115,8 @@ export enum RVOpcode {
   BRANCH   = 0x63,  // BEQ, BNE, BLT, BGE
   JAL      = 0x6F,  // Unconditional jump
   LUI      = 0x37,  // Load upper immediate
-  CUSTOM0  = 0x0B,  // Custom: MVM / SLDR / SSTR / CSET (memristor crossbar)
+  CUSTOM0  = 0x0B,  // Custom-0: MVM / SLDR / SSTR / CSET (memristor crossbar)
+  CUSTOM1  = 0x2B,  // Custom-1: XADD / XSUB / XMUL  (crossbar integer arithmetic)
   MISC_MEM = 0x0F,  // FENCE (thread barrier)
   SYSTEM   = 0x73,  // ECALL (thread completion)
 }
@@ -129,6 +131,7 @@ export const OPCODE_NAMES: Record<number, string> = {
   [RVOpcode.JAL]:      'JAL',
   [RVOpcode.LUI]:      'LUI',
   [RVOpcode.CUSTOM0]:  'IMC',
+  [RVOpcode.CUSTOM1]:  'XA',
   [RVOpcode.MISC_MEM]: 'FENCE',
   [RVOpcode.SYSTEM]:   'ECALL',
 };
@@ -172,6 +175,21 @@ export interface CrossbarState {
   lastMVMResult: number[];           // 16-element output of most recent MVM
   writeEvents: MemristorWriteEvent[]; // recent write history (capped at 20)
 }
+
+/**
+ * Crossbar scratch region for custom-1 integer arithmetic.
+ * Column 62 is dedicated to XADD/XSUB/XMUL operand and result cells.
+ *
+ *  XADD: rows 32(A), 33(B), 34(R)  — conductance superposition  G_R = G_A + G_B − G_MIN
+ *  XSUB: rows 35(A), 36(B), 37(R)  — differential pair           G_R = G_A − G_B + G_MIN
+ *  XMUL: rows 38(V), 39(G), 40(R)  — Ohm's law                   I   = V(A) · G(B)  → R
+ */
+export const XA_SCRATCH = {
+  COL:        62,
+  XADD_ROW_A: 32, XADD_ROW_B: 33, XADD_ROW_R: 34,
+  XSUB_ROW_A: 35, XSUB_ROW_B: 36, XSUB_ROW_R: 37,
+  XMUL_ROW_V: 38, XMUL_ROW_G: 39, XMUL_ROW_R: 40,
+} as const;
 
 /** Full IMC simulation state at one cycle */
 export interface SimulationState {

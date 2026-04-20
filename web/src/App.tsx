@@ -123,6 +123,7 @@ export default function App() {
                   {trace.analysis.metrics.totalInstructions} inst | {trace.analysis.metrics.registersUsed} regs
                   {trace.analysis.metrics.imcOperations > 0 && ` | ${trace.analysis.metrics.imcOperations} MVM`}
                   {(trace.analysis.metrics.crossbarWriteOps ?? 0) > 0 && ` | ${trace.analysis.metrics.crossbarWriteOps} CSET`}
+                  {(trace.analysis.metrics.crossbarArithOps ?? 0) > 0 && ` | ${trace.analysis.metrics.crossbarArithOps} XA`}
                   {trace.analysis.metrics.sharedMemoryBytes > 0 && ` | ${trace.analysis.metrics.sharedMemoryBytes}B scratch`}
                 </span>
               )}

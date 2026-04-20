@@ -82,6 +82,9 @@ export function AnalysisPanel({ analysis }: AnalysisPanelProps) {
         {(metrics.crossbarWriteOps ?? 0) > 0 && (
           <MetricCard label="CSET Writes" value={metrics.crossbarWriteOps} color="#4ec9b0" />
         )}
+        {(metrics.crossbarArithOps ?? 0) > 0 && (
+          <MetricCard label="XA Arith" value={metrics.crossbarArithOps} color="#d19a66" />
+        )}
         {metrics.sharedMemoryBytes > 0 && (
           <MetricCard label="Scratchpad" value={`${metrics.sharedMemoryBytes}B`} color="#4ec9b0" />
         )}

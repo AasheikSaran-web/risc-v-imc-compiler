@@ -75,6 +75,20 @@ const vectorMaxSource = `kernel vector_max(global int* a, global int* b, global 
     }
 }`;
 
+// Crossbar arithmetic: XADD + XSUB + XMUL using custom-1 (0x2B) opcode
+const crossbarArithSource = `kernel crossbar_arith(global int* a, global int* b, global int* out) {
+    int idx = blockIdx * blockDim + threadIdx;
+    int ai = a[idx];
+    int bi = b[idx];
+    int s = 0;
+    int d = 0;
+    int p = 0;
+    xadd(s, ai, bi);
+    xsub(d, ai, bi);
+    xmul(p, ai, bi);
+    out[idx] = s;
+}`;
+
 // Crossbar MVM: each thread programs one row of the weight matrix, then runs analog MVM
 const crossbarMVMSource = `kernel crossbar_mvm(global int* weights, global int* input, global int* output) {
     // Phase 1: each thread loads its weight and programs one crossbar row
@@ -117,6 +131,23 @@ const sharedReductionSource = `kernel shared_reduce(global int* input, global in
 }`;
 
 export const EXAMPLES: Example[] = [
+  {
+    name: 'Crossbar Arith',
+    description: 'XADD + XSUB + XMUL (custom-1)',
+    source: crossbarArithSource,
+    trace: compileTGC(crossbarArithSource),
+    initialMemory: (() => {
+      const mem = new Array(256).fill(0);
+      // a[0..3] = [30, 20, 50, 40]
+      mem[0] = 30; mem[1] = 20; mem[2] = 50; mem[3] = 40;
+      // b[0..3] = [10, 5,  20, 15]
+      mem[64] = 10; mem[65] = 5; mem[66] = 20; mem[67] = 15;
+      // expected sum: [40,25,70,55], diff: [20,15,30,25], mul: [300,100,1000,600]
+      return mem;
+    })(),
+    numBlocks: 1,
+    threadsPerBlock: 4,
+  },
   {
     name: 'Crossbar MVM',
     description: 'CSET weights → analog MVM',

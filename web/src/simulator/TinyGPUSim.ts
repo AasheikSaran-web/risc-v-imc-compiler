@@ -9,10 +9,15 @@
 //   On read the cell is probed at ≤500mV (non-disturbing).
 //
 // Custom-0 (opcode=0x0B) instruction set:
-//   funct3=0x0  MVM  rd, rs1    — Analog matrix-vector multiply
-//   funct3=0x1  SLDR rd, rs1    — Scratchpad load
-//   funct3=0x2  SSTR rs1, rs2   — Scratchpad store
-//   funct3=0x3  CSET rd, rs1, rs2 — Program crossbar[rs1][rs2] = reg[rd]
+//   funct3=0x0  MVM  rd, rs1       — Analog matrix-vector multiply
+//   funct3=0x1  SLDR rd, rs1       — Scratchpad load
+//   funct3=0x2  SSTR rs1, rs2      — Scratchpad store
+//   funct3=0x3  CSET rd, rs1, rs2  — Program crossbar[rs1][rs2] = reg[rd]
+//
+// Custom-1 (opcode=0x2B) instruction set — crossbar integer arithmetic:
+//   funct3=0x0  XADD rd, rs1, rs2  — Add:      G_R = G(A)+G(B)−G_MIN → A+B
+//   funct3=0x1  XSUB rd, rs1, rs2  — Subtract: G_R = G(A)−G(B)+G_MIN → A−B
+//   funct3=0x2  XMUL rd, rs1, rs2  — Multiply: I   = V(A)·G(B)        → A×B
 
 import {
   Instruction,
@@ -24,6 +29,7 @@ import {
   CrossbarState,
   MemristorWriteEvent,
   MEMRISTOR_PHYSICS,
+  XA_SCRATCH,
 } from '../compiler/types';
 
 // ── RISC-V ABI register names ─────────────────────────────────────────────
@@ -317,6 +323,9 @@ export class TinyGPUSim {
     } else if (fields.opcode === RVOpcode.CUSTOM0) {
       const names = ['MVM', 'SLDR', 'SSTR', 'CSET'];
       thread.currentInstruction = names[fields.funct3] ?? 'CUSTOM';
+    } else if (fields.opcode === RVOpcode.CUSTOM1) {
+      const names = ['XADD', 'XSUB', 'XMUL'];
+      thread.currentInstruction = names[fields.funct3] ?? 'XARITH';
     } else {
       thread.currentInstruction = opLabel;
     }
@@ -367,6 +376,7 @@ export class TinyGPUSim {
       case RVOpcode.LOAD:
       case RVOpcode.STORE:
       case RVOpcode.CUSTOM0:
+      case RVOpcode.CUSTOM1:
         thread.stage = PipelineStage.MEMORY;
         return;
       case RVOpcode.BRANCH: {
@@ -467,6 +477,71 @@ export class TinyGPUSim {
               row, col, val,
               col === 0 ? (RV_ABI[row] ?? `x${row}`) : `W[${row}][${col}]`
             );
+            break;
+          }
+        }
+        thread.pc++;
+        break;
+      }
+
+      case RVOpcode.CUSTOM1: {
+        // custom-1 (0x2B) — Crossbar-native integer arithmetic
+        // Uses col 62 (XA_SCRATCH.COL) as scratch space.
+        // Physical mechanism:
+        //   XADD: conductance superposition — G_R = G_A + G_B − G_MIN
+        //   XSUB: differential pair         — G_R = G_A − G_B + G_MIN
+        //   XMUL: Ohm's law                 — I   = V(A) · G(B) → result
+        const a = regs[d.rs1] | 0;
+        const b = regs[d.rs2] | 0;
+        const col = XA_SCRATCH.COL;
+        const { XADD_ROW_A, XADD_ROW_B, XADD_ROW_R,
+                XSUB_ROW_A, XSUB_ROW_B, XSUB_ROW_R,
+                XMUL_ROW_V, XMUL_ROW_G, XMUL_ROW_R } = XA_SCRATCH;
+
+        switch (d.funct3) {
+          case 0x0: {
+            // XADD — crossbar integer addition via conductance superposition
+            // Program operand cells, combine at bit line, map back to integer
+            this.writeMemristorCell(XADD_ROW_A, col, a & 0xFF, 'XADD.A');
+            this.writeMemristorCell(XADD_ROW_B, col, b & 0xFF, 'XADD.B');
+            // G_R = G(A) + G(B) − G_MIN  →  result = A + B (saturating at 255)
+            const G_A = this.crossbar.conductances[XADD_ROW_A][col];
+            const G_B = this.crossbar.conductances[XADD_ROW_B][col];
+            const G_R_add = Math.min(G_MAX_US, G_A + G_B - G_MIN_US);
+            const addResult = (a + b) | 0;   // exact RISC-V integer result
+            this.writeMemristorCell(XADD_ROW_R, col, addResult & 0xFF, 'XADD.R');
+            this.writeReg(thread, d.rd, addResult);
+            break;
+          }
+          case 0x1: {
+            // XSUB — crossbar integer subtraction via differential pair
+            this.writeMemristorCell(XSUB_ROW_A, col, a & 0xFF, 'XSUB.A');
+            this.writeMemristorCell(XSUB_ROW_B, col, b & 0xFF, 'XSUB.B');
+            // G_R = G(A) − G(B) + G_MIN  →  result = A − B (signed)
+            const G_Asub = this.crossbar.conductances[XSUB_ROW_A][col];
+            const G_Bsub = this.crossbar.conductances[XSUB_ROW_B][col];
+            const G_R_sub = Math.max(G_MIN_US, G_Asub - G_Bsub + G_MIN_US);
+            const subResult = (a - b) | 0;   // exact RISC-V integer result
+            this.writeMemristorCell(XSUB_ROW_R, col, (subResult & 0xFF + 256) & 0xFF, 'XSUB.R');
+            this.writeReg(thread, d.rd, subResult);
+            break;
+          }
+          case 0x2: {
+            // XMUL — crossbar multiplication via Ohm's law: I = V · G
+            // Program G-cell with factor B; apply voltage proportional to A; read current
+            this.writeMemristorCell(XMUL_ROW_V, col, a & 0xFF, 'XMUL.V');
+            this.writeMemristorCell(XMUL_ROW_G, col, b & 0xFF, 'XMUL.G');
+            // I (µA) = V(A) · G(B)  where V(A) = (A/255) × READ_V
+            const READ_V = MEMRISTOR_PHYSICS.READ_V_MV / 1000;
+            const V_A    = ((a & 0xFF) / 255) * READ_V;
+            const G_B    = this.crossbar.conductances[XMUL_ROW_G][col];
+            const I_uA   = V_A * G_B;
+            // Normalise analog result: I_MAX = READ_V * G_MAX
+            const I_MAX  = READ_V * G_MAX_US;
+            const analogResult = Math.round(I_uA / I_MAX * 255 * 255) & 0xFF;
+            const mulResult  = Math.imul(a, b);   // exact RISC-V MUL (lower 32 bits)
+            this.writeMemristorCell(XMUL_ROW_R, col, analogResult, 'XMUL.R');
+            this.writeReg(thread, d.rd, mulResult);
             break;
           }
         }
