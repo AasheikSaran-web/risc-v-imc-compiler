@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { TinyGPUSim } from '../simulator/TinyGPUSim';
 import {
   Instruction, SimulationState, PipelineStage, CrossbarState,
-  MEMRISTOR_PHYSICS, MemristorWriteEvent, XA_SCRATCH,
+  MEMRISTOR_PHYSICS, MemristorWriteEvent, XA_SCRATCH, CV_DATA,
 } from '../compiler/types';
 
 interface IMCSimulatorProps {
@@ -81,7 +81,7 @@ export function GPUSimulator({
   if (!state || instructions.length === 0) {
     return (
       <div style={{ padding: '16px', color: '#666', fontSize: '13px' }}>
-        Compile a kernel to start the IMC simulator.
+        Compile a kernel to start the Crossbar Execution Engine.
       </div>
     );
   }
@@ -168,9 +168,9 @@ export function GPUSimulator({
           <div style={{ margin: '8px 4px', padding: '8px', background: '#1a1a2e',
             border: '1px solid #4ec9b0', borderRadius: '6px' }}>
             <div style={{ fontSize: '11px', color: '#4ec9b0', fontWeight: 700, marginBottom: '6px' }}>
-              RISC-V Core T{selectedThreadState.threadId} — Register File (x0–x31)
+              Core T{selectedThreadState.threadId} · Register File x0–x31
               <span style={{ color: '#555', fontWeight: 400, marginLeft: '8px' }}>
-                → each write programs crossbar(reg, col=0) via pot/dep pulses
+                each write programs cell(reg, col=0) via pot/dep pulse sequence
               </span>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
@@ -220,8 +220,8 @@ export function GPUSimulator({
 
         {/* Global memory */}
         <div style={{ marginTop: '8px', padding: '4px' }}>
-          <div style={{ fontSize: '11px', color: '#888', marginBottom: '4px' }}>
-            Global Memory (256 bytes)
+          <div style={{ fontSize: '11px', color: '#888', marginBottom: '4px', fontWeight: 600 }}>
+            Global Data Memory · 256 B
           </div>
           <MemoryHeatmap memory={state.memory} />
         </div>
@@ -229,8 +229,8 @@ export function GPUSimulator({
         {/* Scratchpad memory */}
         {state.sharedMemory.some((v) => v !== 0) && (
           <div style={{ marginTop: '8px', padding: '4px' }}>
-            <div style={{ fontSize: '11px', color: '#4ec9b0', marginBottom: '4px' }}>
-              Scratchpad Memory (64 bytes)
+            <div style={{ fontSize: '11px', color: '#4ec9b0', marginBottom: '4px', fontWeight: 600 }}>
+              On-Chip Scratchpad · 64 B
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1px' }}>
               {state.sharedMemory.slice(0, 32).map((val, i) => (
@@ -265,9 +265,9 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
       {/* ── Section header ── */}
       <div style={{ fontSize: '11px', color: '#4ec9b0', fontWeight: 700,
         marginBottom: '6px', paddingBottom: '3px', borderBottom: '1px solid #4ec9b033' }}>
-        Memristor Crossbar — 64×64 [{MEMRISTOR_PHYSICS.MATERIAL}]
+        Memristor-Based Crossbar Array · 64×64
         <span style={{ color: '#555', fontWeight: 400, marginLeft: '8px', fontSize: '10px' }}>
-          {MEMRISTOR_PHYSICS.G_MIN_US}–{MEMRISTOR_PHYSICS.G_MAX_US} µS · {MEMRISTOR_PHYSICS.LEVELS.toLocaleString()} levels · {MEMRISTOR_PHYSICS.PAPER_REF}
+          {MEMRISTOR_PHYSICS.G_MIN_US}–{MEMRISTOR_PHYSICS.G_MAX_US} µS · {MEMRISTOR_PHYSICS.LEVELS.toLocaleString()} conductance levels · {MEMRISTOR_PHYSICS.PAPER_REF}
         </span>
       </div>
 
@@ -275,9 +275,9 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
         {/* ── Register-file panel (col 0) ── */}
         <div style={{ flex: '1 1 180px' }}>
           <div style={{ fontSize: '10px', color: '#9cdcfe', marginBottom: '4px', fontWeight: 600 }}>
-            Register File ← col 0
+            Register File Backing · Col 0
             <span style={{ color: '#555', fontWeight: 400, marginLeft: '6px' }}>
-              xr → cell(r, 0)
+              each xr mirrored to cell(r, 0)
             </span>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '2px' }}>
@@ -328,8 +328,10 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
         {/* ── Weight matrix panel (cols 1-8, rows 0-7) ── */}
         <div>
           <div style={{ fontSize: '10px', color: '#d19a66', marginBottom: '4px', fontWeight: 600 }}>
-            Weights ← cols 1–8
-            <span style={{ color: '#555', fontWeight: 400, marginLeft: '6px' }}>CSET/MVM region</span>
+            MVM Weight Matrix · Cols 1–16
+            <span style={{ color: '#555', fontWeight: 400, marginLeft: '6px' }}>
+              CSET-programmed · consumed by MVM analog read
+            </span>
           </div>
           {/* Column headers */}
           <div style={{ display: 'flex', gap: '1px', marginBottom: '1px', paddingLeft: '18px' }}>
@@ -382,6 +384,9 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
         </div>
       </div>
 
+      {/* ── Variable data region panel (custom-2 CVLD/CVST) ── */}
+      <VariableDataRegion crossbar={crossbar} />
+
       {/* ── Scratch arithmetic panel (custom-1 XADD/XSUB/XMUL) ── */}
       <ScratchArithmetic crossbar={crossbar} />
 
@@ -389,6 +394,128 @@ function CrossbarVisualization({ crossbar }: { crossbar: CrossbarState }) {
       {crossbar.writeEvents.length > 0 && (
         <WriteEventLog events={crossbar.writeEvents} />
       )}
+    </div>
+  );
+}
+
+// ── Variable data region (custom-2 CVLD/CVST — cols 17–61) ────────────────
+
+function VariableDataRegion({ crossbar }: { crossbar: CrossbarState }) {
+  const { COL_START, COL_END } = CV_DATA;
+  const gRange = G_MAX_US - G_MIN_US;
+  const norm   = (g: number) => Math.max(0, Math.min(1, (g - G_MIN_US) / gRange));
+
+  // Scan for any active cells in the data region
+  const activeCells: Array<{ row: number; col: number; g: number }> = [];
+  for (let r = 0; r < 64; r++) {
+    for (let c = COL_START; c <= COL_END; c++) {
+      const g = crossbar.conductances[r]?.[c] ?? G_MIN_US;
+      if (g > G_MIN_US + MEMRISTOR_PHYSICS.G_STEP_US) {
+        activeCells.push({ row: r, col: c, g });
+      }
+    }
+  }
+
+  return (
+    <div style={{ marginTop: '10px' }}>
+      <div style={{ fontSize: '10px', color: '#c586c0', fontWeight: 600, marginBottom: '4px',
+        display: 'flex', alignItems: 'center', gap: '6px' }}>
+        Variable Data Region · Cols {COL_START}–{COL_END}
+        <span style={{ color: '#555', fontWeight: 400 }}>
+          CVLD/CVST safe zone · non-disturbing read ≤ {MEMRISTOR_PHYSICS.READ_V_MV} mV
+        </span>
+        {activeCells.length === 0 && (
+          <span style={{ color: '#444', marginLeft: 'auto' }}>
+            — use cvld/cvst() to allocate variables
+          </span>
+        )}
+      </div>
+
+      {/* Preview heatmap: rows 0–7 × cols 17–24 (first 8 data columns) */}
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ display: 'flex', gap: '1px', marginBottom: '1px', paddingLeft: '22px' }}>
+            {Array.from({ length: 8 }, (_, c) => (
+              <div key={c} style={{ width: '20px', fontSize: '8px', color: '#555', textAlign: 'center' }}>
+                c{COL_START + c}
+              </div>
+            ))}
+          </div>
+          {Array.from({ length: 8 }, (_, r) => (
+            <div key={r} style={{ display: 'flex', gap: '1px', marginBottom: '1px', alignItems: 'center' }}>
+              <div style={{ width: '20px', fontSize: '8px', color: '#555', textAlign: 'right', paddingRight: '2px' }}>
+                r{r}
+              </div>
+              {Array.from({ length: 8 }, (_, c) => {
+                const col = COL_START + c;
+                const G = crossbar.conductances[r]?.[col] ?? G_MIN_US;
+                const n = norm(G);
+                const isActive = G > G_MIN_US + MEMRISTOR_PHYSICS.G_STEP_US;
+                return (
+                  <div
+                    key={c}
+                    title={`var[${r}][${col}]\nG = ${G.toFixed(1)} µS\nvalue ≈ ${Math.round(n * 255)}`}
+                    style={{
+                      width: '20px', height: '20px', borderRadius: '2px',
+                      background: isActive
+                        ? `rgba(197,134,192,${0.15 + n * 0.85})`
+                        : '#1a1a1a',
+                      border: `1px solid ${isActive ? '#c586c044' : '#222'}`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '7px', color: n > 0.5 ? '#000' : '#666',
+                    }}
+                  >
+                    {isActive ? Math.round(n * 99) : ''}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+
+        {/* Active variable list */}
+        <div style={{ flex: 1, minWidth: '160px' }}>
+          <div style={{ fontSize: '9px', color: '#555', marginBottom: '3px' }}>
+            Allocated Variables ({activeCells.length})
+          </div>
+          {activeCells.length === 0 ? (
+            <div style={{ fontSize: '9px', color: '#333', fontStyle: 'italic', padding: '4px' }}>
+              No crossbar-backed variables live.
+            </div>
+          ) : (
+            <div style={{ maxHeight: '140px', overflow: 'auto' }}>
+              {activeCells.slice(0, 12).map((cell, i) => (
+                <div key={i} style={{
+                  display: 'flex', alignItems: 'center', gap: '4px',
+                  padding: '2px 4px', marginBottom: '1px',
+                  background: '#111', borderRadius: '2px',
+                  border: '1px solid #1a1a2e',
+                  fontSize: '9px', fontFamily: 'monospace',
+                }}>
+                  <span style={{ color: '#9cdcfe', width: '60px' }}>
+                    var[{cell.row},{cell.col}]
+                  </span>
+                  <div style={{ flex: 1, height: '5px', background: '#222',
+                    borderRadius: '2px', overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${Math.max(3, norm(cell.g) * 100)}%`, height: '100%',
+                      background: `linear-gradient(to right, #c586c044, #c586c0)`,
+                    }} />
+                  </div>
+                  <span style={{ color: '#c586c0', width: '48px', textAlign: 'right' }}>
+                    {cell.g >= 1000 ? `${(cell.g/1000).toFixed(1)}mS` : `${cell.g.toFixed(0)}µS`}
+                  </span>
+                </div>
+              ))}
+              {activeCells.length > 12 && (
+                <div style={{ fontSize: '8px', color: '#555', padding: '2px 4px' }}>
+                  +{activeCells.length - 12} more…
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -432,9 +559,9 @@ function ScratchArithmetic({ crossbar }: { crossbar: CrossbarState }) {
 
   return (
     <div style={{ marginTop: '8px' }}>
-      <div style={{ fontSize: '10px', color: '#888', fontWeight: 600, marginBottom: '4px',
+      <div style={{ fontSize: '10px', color: '#98c379', fontWeight: 600, marginBottom: '4px',
         display: 'flex', alignItems: 'center', gap: '6px' }}>
-        Crossbar Arithmetic (custom-1 · col 62)
+        Analog Arithmetic Unit · Custom-1 · Col 62
         {!anyActive && (
           <span style={{ color: '#444', fontWeight: 400 }}>
             — use xadd/xsub/xmul() in kernel to activate
@@ -525,18 +652,24 @@ function WriteEventLog({ events }: { events: MemristorWriteEvent[] }) {
 
   return (
     <div style={{ marginTop: '8px' }}>
-      <div style={{ fontSize: '10px', color: '#888', marginBottom: '4px', fontWeight: 600 }}>
-        Memristor Write Log
+      <div style={{ fontSize: '10px', color: '#e5c07b', marginBottom: '4px', fontWeight: 600 }}>
+        Memristor Program Log
         <span style={{ color: '#555', fontWeight: 400, marginLeft: '6px' }}>
-          {MEMRISTOR_PHYSICS.POT_V_MV}mV/{MEMRISTOR_PHYSICS.POT_NS}ns (pot) · {MEMRISTOR_PHYSICS.DEP_V_MV}mV/{MEMRISTOR_PHYSICS.DEP_NS}ns (dep)
+          {MEMRISTOR_PHYSICS.POT_V_MV}mV/{MEMRISTOR_PHYSICS.POT_NS}ns (potentiation) · {MEMRISTOR_PHYSICS.DEP_V_MV}mV/{MEMRISTOR_PHYSICS.DEP_NS}ns (depression)
         </span>
       </div>
       {recent.map((ev, i) => {
-        const isReg   = ev.col === 0;
-        const isWeight = ev.col >= 1;
+        const isReg       = ev.col === 0;
+        const isWeight    = ev.col >= 1 && ev.col <= 16;
+        const isDataRegion = ev.col >= CV_DATA.COL_START && ev.col <= CV_DATA.COL_END;
+        const isXAScratch = ev.col === XA_SCRATCH.COL;
         const pulseColor = ev.pulseType === 'pot' ? '#98c379' : ev.pulseType === 'dep' ? '#e06c75' : '#888';
         const dG = ev.newG_us - ev.prevG_us;
-        const arrow = isReg ? '→ reg-file' : isWeight ? '→ weight' : '→ cell';
+        const arrow = isReg ? '→ reg-file'
+                    : isWeight ? '→ wt-matrix'
+                    : isDataRegion ? '→ data-region'
+                    : isXAScratch ? '→ xa-scratch'
+                    : '→ cell';
         return (
           <div key={i} style={{
             display: 'flex', alignItems: 'center', gap: '6px',

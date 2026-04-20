@@ -75,6 +75,28 @@ const vectorMaxSource = `kernel vector_max(global int* a, global int* b, global 
     }
 }`;
 
+// Crossbar variable load/store: custom-2 (0x5B) CVLD/CVST with safe memory mapping.
+// Variables are stored directly in the memristor data region (cols 17-61), bypassing
+// global DRAM — then consumed by custom-1 crossbar arithmetic. Reads use V ≤ 500mV
+// (non-disturbing); writes are bounds-checked so reserved regions are never corrupted.
+const crossbarVarSource = `kernel crossbar_var(global int* a, global int* b, global int* out) {
+    int idx = blockIdx * blockDim + threadIdx;
+    int ai = a[idx];
+    int bi = b[idx];
+    // Store operands directly into the memristor data region (cols 17, 18)
+    cvst(ai, threadIdx, 17);
+    cvst(bi, threadIdx, 18);
+    // Load them back non-destructively (V_read <= 500mV, below V_th=830mV)
+    int va = 0;
+    int vb = 0;
+    cvld(va, threadIdx, 17);
+    cvld(vb, threadIdx, 18);
+    // Crossbar-native addition on the reloaded operands
+    int s = 0;
+    xadd(s, va, vb);
+    out[idx] = s;
+}`;
+
 // Crossbar arithmetic: XADD + XSUB + XMUL using custom-1 (0x2B) opcode
 const crossbarArithSource = `kernel crossbar_arith(global int* a, global int* b, global int* out) {
     int idx = blockIdx * blockDim + threadIdx;
@@ -131,6 +153,20 @@ const sharedReductionSource = `kernel shared_reduce(global int* input, global in
 }`;
 
 export const EXAMPLES: Example[] = [
+  {
+    name: 'Crossbar Variables',
+    description: 'CVLD + CVST (custom-2) → memristor-backed variables',
+    source: crossbarVarSource,
+    trace: compileTGC(crossbarVarSource),
+    initialMemory: (() => {
+      const mem = new Array(256).fill(0);
+      mem[0] = 30; mem[1] = 20; mem[2] = 50; mem[3] = 40;
+      mem[64] = 10; mem[65] = 5; mem[66] = 20; mem[67] = 15;
+      return mem;
+    })(),
+    numBlocks: 1,
+    threadsPerBlock: 4,
+  },
   {
     name: 'Crossbar Arith',
     description: 'XADD + XSUB + XMUL (custom-1)',

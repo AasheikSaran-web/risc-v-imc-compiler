@@ -85,6 +85,12 @@ export function AnalysisPanel({ analysis }: AnalysisPanelProps) {
         {(metrics.crossbarArithOps ?? 0) > 0 && (
           <MetricCard label="XA Arith" value={metrics.crossbarArithOps} color="#d19a66" />
         )}
+        {(metrics.cvLoadOps ?? 0) > 0 && (
+          <MetricCard label="CVLD Loads" value={metrics.cvLoadOps} color="#c586c0" />
+        )}
+        {(metrics.cvStoreOps ?? 0) > 0 && (
+          <MetricCard label="CVST Stores" value={metrics.cvStoreOps} color="#c586c0" />
+        )}
         {metrics.sharedMemoryBytes > 0 && (
           <MetricCard label="Scratchpad" value={`${metrics.sharedMemoryBytes}B`} color="#4ec9b0" />
         )}

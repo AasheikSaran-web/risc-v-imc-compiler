@@ -15,6 +15,7 @@ import { CompilationTrace, Instruction, AnalysisResult, DivergenceInfo, Coalesci
 type TokenKind =
   | 'kernel' | 'global' | 'int' | 'for' | 'if' | 'else' | 'shared' | 'mvm' | 'cset'
   | 'xadd' | 'xsub' | 'xmul'
+  | 'cvld' | 'cvst'
   | 'threadIdx' | 'blockIdx' | 'blockDim'
   | '__syncthreads'
   | 'ident' | 'number'
@@ -32,7 +33,7 @@ interface Token {
 function lex(source: string): Token[] {
   const tokens: Token[] = [];
   let pos = 0, line = 1, col = 1;
-  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm', 'cset', 'xadd', 'xsub', 'xmul']);
+  const keywords = new Set(['kernel', 'global', 'int', 'for', 'if', 'else', 'shared', 'mvm', 'cset', 'xadd', 'xsub', 'xmul', 'cvld', 'cvst']);
   const builtins = new Set(['threadIdx', 'blockIdx', 'blockDim']);
 
   while (pos < source.length) {
@@ -123,6 +124,8 @@ type Stmt =
   | { type: 'xadd'; dest: string; a: Expr; b: Expr }    // Crossbar integer add
   | { type: 'xsub'; dest: string; a: Expr; b: Expr }    // Crossbar integer subtract
   | { type: 'xmul'; dest: string; a: Expr; b: Expr }    // Crossbar integer multiply
+  | { type: 'cvld'; dest: string; row: Expr; col: Expr }  // Crossbar variable load (custom-2)
+  | { type: 'cvst'; src: Expr; row: Expr; col: Expr }     // Crossbar variable store (custom-2)
   | { type: 'for'; init: Stmt; cond: Expr; iterVar: string; iterExpr: Expr; body: Stmt[] }
   | { type: 'if'; cond: Expr; then: Stmt[]; else: Stmt[] };
 
@@ -235,6 +238,34 @@ function parse(tokens: Token[]): Kernel {
       expect(')');
       expect(';');
       return { type: op, dest, a, b };
+    }
+    // cvld(dest, row, col) — custom-2 crossbar variable load
+    // Non-destructive read at V_read ≤ 500mV; col enforced in [17, 61]
+    if (peek().kind === 'cvld') {
+      advance();
+      expect('(');
+      const dest = expect('ident').text;
+      expect(',');
+      const row = parseExpr();
+      expect(',');
+      const col = parseExpr();
+      expect(')');
+      expect(';');
+      return { type: 'cvld', dest, row, col };
+    }
+    // cvst(src, row, col) — custom-2 crossbar variable store
+    // Pot/dep pulse sequence; col enforced in [17, 61] to protect reserved regions
+    if (peek().kind === 'cvst') {
+      advance();
+      expect('(');
+      const src = parseExpr();
+      expect(',');
+      const row = parseExpr();
+      expect(',');
+      const col = parseExpr();
+      expect(')');
+      expect(';');
+      return { type: 'cvst', src, row, col };
     }
     if (peek().kind === 'for') {
       advance(); expect('(');
@@ -423,6 +454,7 @@ interface IRInstruction {
   isBarrier?: boolean;
   isMVM?: boolean;
   isXArith?: boolean;  // XADD / XSUB / XMUL
+  isCVMem?: boolean;   // CVLD / CVST (crossbar variable load/store)
 }
 
 // Branch info tracked from comparison expressions
@@ -676,6 +708,46 @@ function compile(kernel: Kernel): {
         });
         break;
       }
+      case 'cvld': {
+        // CVLD: load from crossbar data region (cols 17–61) into dest register.
+        // Read voltage ≤ 500mV — non-disturbing, below V_th=830mV.
+        const rowSSA = genExpr(stmt.row);
+        const colSSA = genExpr(stmt.col);
+        const rowReg = regOf(rowSSA);
+        const colReg = regOf(colSSA);
+        const destSSA = nextSSA++;
+        const destReg = allocReg(destSSA);
+        vars[stmt.dest] = destSSA;
+        irLines.push(`  %${destSSA} = riscv.cvld crossbar[${regName(rowReg)}][${regName(colReg)}]`);
+        irLines.push(`  // → non-disturbing read at ≤500mV (V_th=830mV); data region cols 17–61`);
+        irOps.push({
+          op: 'CVLD',
+          rd: destReg, rs: rowReg, rt: colReg,
+          asm: `CVLD ${asmReg(destReg)}, ${asmReg(rowReg)}, ${asmReg(colReg)}`,
+          isCVMem: true,
+        });
+        break;
+      }
+      case 'cvst': {
+        // CVST: write to crossbar data region (cols 17–61) from src expression.
+        // Pot/dep pulse sequence; bounds enforced — cannot overwrite reg-file (col 0),
+        // weight matrix (cols 1–16), XA scratch (col 62), or reserved (col 63).
+        const srcSSA = genExpr(stmt.src);
+        const rowSSA = genExpr(stmt.row);
+        const colSSA = genExpr(stmt.col);
+        const srcReg = regOf(srcSSA);
+        const rowReg = regOf(rowSSA);
+        const colReg = regOf(colSSA);
+        irLines.push(`  riscv.cvst crossbar[${regName(rowReg)}][${regName(colReg)}] = ${regName(srcReg)}`);
+        irLines.push(`  // → pot/dep pulses; col clamped to [17,61] — no reg-file or XA scratch overlap`);
+        irOps.push({
+          op: 'CVST',
+          rd: srcReg, rs: rowReg, rt: colReg,
+          asm: `CVST ${asmReg(srcReg)}, ${asmReg(rowReg)}, ${asmReg(colReg)}`,
+          isCVMem: true,
+        });
+        break;
+      }
       case 'store': {
         const indexSSA = genExpr(stmt.index);
         const valueSSA = genExpr(stmt.value);
@@ -826,6 +898,11 @@ function compile(kernel: Kernel): {
       case 'XADD':  binary = encodeR(0x2B, rd, 0x0, rs1, rs2, 0x00); break;
       case 'XSUB':  binary = encodeR(0x2B, rd, 0x1, rs1, rs2, 0x00); break;
       case 'XMUL':  binary = encodeR(0x2B, rd, 0x2, rs1, rs2, 0x00); break;
+      // custom-2 (0x5B) — crossbar variable load/store
+      // CVLD: rd=dest, rs1=row, rs2=col; reads at ≤500mV (non-disturbing)
+      // CVST: rd=src,  rs1=row, rs2=col; applies pot/dep pulses to data region
+      case 'CVLD':  binary = encodeR(0x5B, rd, 0x0, rs1, rs2, 0x00); break;
+      case 'CVST':  binary = encodeR(0x5B, rd, 0x1, rs1, rs2, 0x00); break;
       case 'FENCE': binary = 0x0000100F; break;
       case 'ECALL': binary = 0x00000073; break;
       case 'BEQ':   binary = encodeB(0x63, 0x0, rs1, rs2, (target - i) * 4); break;
@@ -890,6 +967,8 @@ function analyzeCompilation(
   let imcOps = 0;
   let csetOps = 0;
   let xArithOps = 0;
+  let cvLoadOps = 0;
+  let cvStoreOps = 0;
   let sharedMemBytes = 0;
 
   for (const stmt of kernel.body) {
@@ -990,6 +1069,29 @@ function analyzeCompilation(
       });
     }
 
+    if (op.isCVMem) {
+      memoryCount++;
+      if (op.op === 'CVLD') {
+        cvLoadOps++;
+        coalescing.push({
+          instructionAddr: i,
+          accessPattern: 'coalesced',
+          addresses: [],
+          transactionsNeeded: 1,
+          description: 'CVLD: non-disturbing read (≤500mV) from crossbar data region cols 17–61; preserves stored conductance state',
+        });
+      } else if (op.op === 'CVST') {
+        cvStoreOps++;
+        coalescing.push({
+          instructionAddr: i,
+          accessPattern: 'coalesced',
+          addresses: [],
+          transactionsNeeded: 1,
+          description: 'CVST: pot/dep pulse write to data region cols 17–61; memory-mapped to avoid reg-file (col 0), weight matrix (cols 1–16), and XA scratch (col 62)',
+        });
+      }
+    }
+
     if (op.isBarrier) barrierCount++;
     if (['ADD', 'SUB', 'MUL', 'DIV', 'ADDI'].includes(op.op)) computeCount++;
   }
@@ -1014,11 +1116,13 @@ function analyzeCompilation(
       imcOperations: imcOps,
       crossbarWriteOps: csetOps,
       crossbarArithOps: xArithOps,
+      cvLoadOps,
+      cvStoreOps,
       barrierCount,
       estimatedCycles,
       crossbarCyclesSaved,
       computeToMemoryRatio: Math.round(computeToMemoryRatio * 100) / 100,
-      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} MVM ops` : ''}${csetOps > 0 ? `, ${csetOps} CSET writes` : ''}${xArithOps > 0 ? `, ${xArithOps} XA arith` : ''}`,
+      optimizationSummary: `Register reuse active, ${totalInstructions} RISC-V instructions${imcOps > 0 ? `, ${imcOps} MVM ops` : ''}${csetOps > 0 ? `, ${csetOps} CSET writes` : ''}${xArithOps > 0 ? `, ${xArithOps} XA arith` : ''}${cvLoadOps > 0 ? `, ${cvLoadOps} CVLD` : ''}${cvStoreOps > 0 ? `, ${cvStoreOps} CVST` : ''}`,
     },
   };
 }

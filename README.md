@@ -1,10 +1,10 @@
 # RISC-V IMC Compiler
 
-**An MLIR-based compiler that lowers parallel kernels to RISC-V instructions executing on a 64×64 molecular memristor crossbar — making In-Memory Compute visible, step by step.**
+**An MLIR-based compiler that lowers parallel kernels to RISC-V instructions executing on a 64×64 memristor-based crossbar — making In-Memory Compute visible, step by step.**
 
-Write a kernel in a C-like DSL, watch it lower through RISC-V intermediate representations, see 32-bit binary instructions get emitted, and then simulate those instructions running on a memristor crossbar — all in your browser.
+Write a kernel in a C-like DSL, watch it lower through RISC-V intermediate representations, see 32-bit binary instructions get emitted, and then simulate those instructions running on a memristor-based crossbar — all in your browser.
 
-Built on [MLIR](https://mlir.llvm.org/), targeting **RISC-V RV32IM** augmented with two custom crossbar extensions: **custom-0** (MVM / SLDR / SSTR / CSET) and **custom-1** (XADD / XSUB / XMUL).
+Built on [MLIR](https://mlir.llvm.org/), targeting **RISC-V RV32IM** augmented with three custom crossbar extensions: **custom-0** (MVM / SLDR / SSTR / CSET), **custom-1** (XADD / XSUB / XMUL), and **custom-2** (CVLD / CVST — crossbar-native variable load/store with safe memory mapping).
 
 **By [Aasheik Saran](https://github.com/AasheikSaran-web)**
 
@@ -70,8 +70,10 @@ RISC-V:   t0 = a[i]   (LW t0, 0(t1))
 ```
 
 - **Column 0** — register file backing (rows 0–31 store conductance encoding of x0–x31)
-- **Columns 1–63** — weight matrix for MVM operations
+- **Columns 1–16** — MVM weight matrix (programmed via CSET)
+- **Columns 17–61** — variable data region (CVLD/CVST safe zone)
 - **Column 62** — scratch region for XADD / XSUB / XMUL (rows 32–40)
+- **Column 63** — reserved
 
 The visualizer shows every register write as a pot/dep pulse event, with the resulting conductance in µS.
 
@@ -81,6 +83,7 @@ RISC-V is an open, royalty-free ISA with a reserved **custom opcode space** (cus
 
 - **custom-0 (`0x0B`)** — crossbar matrix/memory operations (MVM, SLDR, SSTR, CSET)
 - **custom-1 (`0x2B`)** — crossbar integer arithmetic (XADD, XSUB, XMUL)
+- **custom-2 (`0x5B`)** — crossbar variable load/store with safe memory mapping (CVLD, CVST)
 
 ---
 
@@ -114,7 +117,7 @@ RISC-V is an open, royalty-free ISA with a reserved **custom opcode space** (cus
             ▼
    ┌──────────────────┐
    │  Binary Emitter  │   Encodes each op into a 32-bit RISC-V word.
-   └────────┬─────────┘   custom-0 and custom-1 words for IMC instructions.
+   └────────┬─────────┘   custom-0/1/2 words for IMC instructions.
             │
             ▼
     32-bit RISC-V Binary
@@ -126,7 +129,7 @@ RISC-V is an open, royalty-free ISA with a reserved **custom opcode space** (cus
 
 ## RISC-V ISA
 
-This compiler targets **RISC-V RV32IM** augmented with two custom memristor crossbar extensions.
+This compiler targets **RISC-V RV32IM** augmented with three custom memristor crossbar extensions.
 
 ### Instruction Formats (32-bit)
 
@@ -218,6 +221,57 @@ XMUL — Ohm's law: I = V × G
        →  rd = A × B  (exact RISC-V integer semantics preserved)
 ```
 
+### Custom-2: Crossbar Variable Load/Store Extension (opcode `0x5B`)
+
+The `custom-2` opcode (`1011011` in binary) is unused in standard RISC-V and allocated here for **crossbar-native variable load and store**. When a variable is declared/assigned with intent to be consumed by custom-0 or custom-1 crossbar instructions, the compiler can route it through `cvld` / `cvst` rather than standard `LW` / `SW` — keeping the data resident in the memristor array and eliminating the round-trip through DRAM.
+
+Crucially, **memory mapping is bounds-enforced in hardware** so stored bits in reserved regions (register file, weight matrix, XA scratch) cannot be corrupted by a stray CVST.
+
+| funct3 | Mnemonic | Operation | Physical Mechanism |
+|--------|----------|-----------|-------------------|
+| `000` | **CVLD** rd, rs1, rs2 | rd = value(crossbar[rs1][rs2]) | Non-disturbing read at V_read ≤ 500 mV (below V_th = 830 mV) — stored conductance is preserved |
+| `001` | **CVST** rd, rs1, rs2 | crossbar[rs1][rs2] = conductance(rd) | Pot/dep pulse sequence; writes outside cols 17–61 are silently dropped |
+
+**Binary encoding (R-type, custom-2):**
+```
+  31      25 24   20 19   15 14  12 11    7 6      0
+ ┌──────────┬───────┬───────┬──────┬───────┬────────┐
+ │ 0000000  │  rs2  │  rs1  │funct3│  rd   │1011011 │
+ └──────────┴───────┴───────┴──────┴───────┴────────┘
+   (col)    (row)           (value/dest)
+```
+
+**Memory mapping contract (crossbar, 64×64):**
+
+| Column range | Purpose | CVLD | CVST |
+|--------------|---------|:----:|:----:|
+| `0` | Register file backing (x0–x31) | ✓ | **blocked** |
+| `1–16` | MVM weight matrix | ✓ | **blocked** (use CSET) |
+| `17–61` | **Variable data region** | ✓ | ✓ |
+| `62` | XA arithmetic scratch | ✓ | **blocked** |
+| `63` | Reserved | ✓ | **blocked** |
+
+The hardware checks the column operand on every CVST and drops the write if it falls outside `[17, 61]`. This guarantees that a kernel bug in address calculation can never clobber the register file or overwrite a programmed weight matrix — a class of error that would otherwise silently destroy state because memristor writes are not idempotent.
+
+Reads are always permitted because the read path uses a voltage below the device's write threshold (`V_read = 500 mV < V_th = 830 mV`), which leaves the stored conductance state unchanged. This is the **non-destructive read** property of the device — it underwrites the entire variable-storage scheme.
+
+**Physical detail:**
+
+```
+CVLD — Non-disturbing variable load
+  Step 1: Apply V_read (≤500 mV) across crossbar[rs1][rs2]
+  Step 2: Sense current I_read = V_read · G
+  Step 3: rd = round((G − G_MIN) / (G_MAX − G_MIN) × 255)
+       →  No state change to the cell (V_read < V_th)
+
+CVST — Variable store via pot/dep pulses
+  Pre:  Check rs2 ∈ [17, 61]; if not, silently drop
+  Step 1: G_target = G_MIN + (rd & 0xFF) / 255 × (G_MAX − G_MIN)
+  Step 2: Apply pot pulses (900 mV / 80 ns) while G < G_target
+          or  dep pulses (-750 mV / 65 ns) while G > G_target
+  Step 3: Cell converges to G_target within RMSE < 42 nS
+```
+
 ### Register File (x0–x31, RISC-V ABI)
 
 | Registers | ABI Name | Role |
@@ -239,24 +293,24 @@ Linear scan allocates **20 GPRs** (x5–x24). Every write to x0–x31 **also pro
 ## Crossbar Physical Layout (64×64)
 
 ```
-         col 0      col 1 … col 16    col 17 … col 61   col 62     col 63
-         (REG FILE) (MVM WEIGHTS  )   (unused       )   (XA SCRATCH) …
+         col 0      col 1 … col 16    col 17 … col 61         col 62       col 63
+         (REG FILE) (MVM WEIGHTS  )   (VARIABLE DATA REGION)  (XA SCRATCH)  …
 
-row 0    x0 reg     W[0][1]…W[0][16]  —                 —           —
-row 1    x1 reg     W[1][1]…W[1][16]  —                 —           —
-…        …          …                 —                 —           —
-row 31   x31 reg    W[31][1]          —                 —           —
-row 32   —          —                 —                 XADD.A      —
-row 33   —          —                 —                 XADD.B      —
-row 34   —          —                 —                 XADD.R      —
-row 35   —          —                 —                 XSUB.A      —
-row 36   —          —                 —                 XSUB.B      —
-row 37   —          —                 —                 XSUB.R      —
-row 38   —          —                 —                 XMUL.V      —
-row 39   —          —                 —                 XMUL.G      —
-row 40   —          —                 —                 XMUL.R      —
-…        —          —                 —                 —           —
-row 63   —          —                 —                 —           —
+row 0    x0 reg     W[0][1]…W[0][16]  cvld/cvst[0][17..61]  —           —
+row 1    x1 reg     W[1][1]…W[1][16]  cvld/cvst[1][17..61]  —           —
+…        …          …                 …                     —           —
+row 31   x31 reg    W[31][1]          cvld/cvst[31][17..61] —           —
+row 32   —          —                 cvld/cvst[32][17..61] XADD.A      —
+row 33   —          —                 cvld/cvst[33][17..61] XADD.B      —
+row 34   —          —                 cvld/cvst[34][17..61] XADD.R      —
+row 35   —          —                 cvld/cvst[35][17..61] XSUB.A      —
+row 36   —          —                 cvld/cvst[36][17..61] XSUB.B      —
+row 37   —          —                 cvld/cvst[37][17..61] XSUB.R      —
+row 38   —          —                 cvld/cvst[38][17..61] XMUL.V      —
+row 39   —          —                 cvld/cvst[39][17..61] XMUL.G      —
+row 40   —          —                 cvld/cvst[40][17..61] XMUL.R      —
+…        —          —                 …                     —           —
+row 63   —          —                 cvld/cvst[63][17..61] —           —
 ```
 
 ---
@@ -292,6 +346,8 @@ A minimal C-like language extended with crossbar instructions:
 | `xadd()` | crossbar add | `xadd(dest, a, b)` | `XADD` (custom-1, funct3=0) |
 | `xsub()` | crossbar sub | `xsub(dest, a, b)` | `XSUB` (custom-1, funct3=1) |
 | `xmul()` | crossbar mul | `xmul(dest, a, b)` | `XMUL` (custom-1, funct3=2) |
+| `cvld()` | crossbar var load | `cvld(dest, row, col)` | `CVLD` (custom-2, funct3=0) |
+| `cvst()` | crossbar var store | `cvst(src, row, col)` | `CVST` (custom-2, funct3=1) |
 | `threadIdx` | builtin | expression | `x25` register |
 | `blockIdx` | builtin | expression | `x26` register |
 | `blockDim` | builtin | expression | `x27` register |
@@ -336,6 +392,27 @@ kernel crossbar_arith(global int* a, global int* b, global int* out) {
 ```
 
 ```c
+// Crossbar variable load/store: keep operands resident in the memristor array
+kernel crossbar_var(global int* a, global int* b, global int* out) {
+    int idx = blockIdx * blockDim + threadIdx;
+    int ai = a[idx];
+    int bi = b[idx];
+    // CVST — program cells in variable data region (cols 17–61); bounds-enforced
+    cvst(ai, threadIdx, 17);   // crossbar[threadIdx][17] = G(ai)
+    cvst(bi, threadIdx, 18);   // crossbar[threadIdx][18] = G(bi)
+    // CVLD — non-disturbing read (V_read ≤ 500 mV < V_th = 830 mV)
+    int va = 0;
+    int vb = 0;
+    cvld(va, threadIdx, 17);   // va = value(crossbar[threadIdx][17])
+    cvld(vb, threadIdx, 18);   // vb = value(crossbar[threadIdx][18])
+    // XADD on memristor-resident operands — no DRAM round-trip
+    int s = 0;
+    xadd(s, va, vb);
+    out[idx] = s;
+}
+```
+
+```c
 // Shared memory with barrier synchronization
 kernel shared_reduce(global int* input, global int* output) {
     shared int scratch[4];
@@ -373,8 +450,9 @@ Below: **32-bit Binary View** — color-coded by field (opcode red, rd blue, fun
 - Thread cards showing pipeline stage, PC, and register values
 - **Register File Crossbar Panel** (col 0) — all 32 registers with conductance in µS
 - **Weight Matrix Heatmap** (cols 1–8, rows 0–7) — heat-map of programmed MVM weights
-- **Crossbar Arithmetic Panel** — XADD/XSUB/XMUL scratch cells (col 62) with conductance bars and physics formulas, activated when custom-1 instructions execute
-- **Memristor Write Log** — recent pot/dep pulse events: cell address, ΔG, pulse count
+- **Variable Data Region** (cols 17–61) — 8×8 heatmap of CVLD/CVST cells plus a list of allocated variables with conductance bars; only visible when custom-2 instructions execute
+- **Analog Arithmetic Unit** (col 62) — XADD/XSUB/XMUL scratch cells with conductance bars and physics formulas; activated when custom-1 instructions execute
+- **Memristor Program Log** — recent pot/dep pulse events: cell address, region annotation (reg-file / weight-matrix / data-region / xa-scratch), ΔG, pulse count
 
 **Analysis tab:**
 - IMC Performance Score (memory efficiency, branch uniformity, register pressure, crossbar utilization)

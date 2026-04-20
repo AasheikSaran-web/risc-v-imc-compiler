@@ -18,6 +18,17 @@
 //   funct3=0x0  XADD rd, rs1, rs2  — Add:      G_R = G(A)+G(B)−G_MIN → A+B
 //   funct3=0x1  XSUB rd, rs1, rs2  — Subtract: G_R = G(A)−G(B)+G_MIN → A−B
 //   funct3=0x2  XMUL rd, rs1, rs2  — Multiply: I   = V(A)·G(B)        → A×B
+//
+// Custom-2 (opcode=0x5B) instruction set — crossbar variable load/store:
+//   funct3=0x0  CVLD rd, rs1, rs2  — Load:     rd  ← conductanceToValue(crossbar[rs1][rs2])
+//   funct3=0x1  CVST rd, rs1, rs2  — Store:    crossbar[rs1][rs2] ← valueToConductance(rd)
+//
+// Memory mapping (safe zones enforced by hardware):
+//   Col  0      — register-file backing     (reserved — CVST blocked)
+//   Cols 1–16   — MVM weight matrix         (reserved — CVST blocked)
+//   Cols 17–61  — variable data region      ← CVLD/CVST safe zone
+//   Col  62     — XA arithmetic scratch     (reserved — CVST blocked)
+//   Col  63     — reserved
 
 import {
   Instruction,
@@ -30,6 +41,7 @@ import {
   MemristorWriteEvent,
   MEMRISTOR_PHYSICS,
   XA_SCRATCH,
+  CV_DATA,
 } from '../compiler/types';
 
 // ── RISC-V ABI register names ─────────────────────────────────────────────
@@ -326,6 +338,9 @@ export class TinyGPUSim {
     } else if (fields.opcode === RVOpcode.CUSTOM1) {
       const names = ['XADD', 'XSUB', 'XMUL'];
       thread.currentInstruction = names[fields.funct3] ?? 'XARITH';
+    } else if (fields.opcode === RVOpcode.CUSTOM2) {
+      const names = ['CVLD', 'CVST'];
+      thread.currentInstruction = names[fields.funct3] ?? 'CVMEM';
     } else {
       thread.currentInstruction = opLabel;
     }
@@ -377,6 +392,7 @@ export class TinyGPUSim {
       case RVOpcode.STORE:
       case RVOpcode.CUSTOM0:
       case RVOpcode.CUSTOM1:
+      case RVOpcode.CUSTOM2:
         thread.stage = PipelineStage.MEMORY;
         return;
       case RVOpcode.BRANCH: {
@@ -542,6 +558,45 @@ export class TinyGPUSim {
             const mulResult  = Math.imul(a, b);   // exact RISC-V MUL (lower 32 bits)
             this.writeMemristorCell(XMUL_ROW_R, col, analogResult, 'XMUL.R');
             this.writeReg(thread, d.rd, mulResult);
+            break;
+          }
+        }
+        thread.pc++;
+        break;
+      }
+
+      case RVOpcode.CUSTOM2: {
+        // custom-2 (0x5B) — Crossbar Variable Load/Store
+        //
+        // Memory mapping (hardware-enforced bounds):
+        //   col  0      → register-file backing (CVST blocked)
+        //   cols 1–16   → MVM weight matrix     (CVST blocked)
+        //   cols 17–61  → variable data region  (CVLD/CVST safe)
+        //   col  62     → XA arithmetic scratch (CVST blocked)
+        //   col  63     → reserved
+        //
+        // CVLD reads at V_read ≤ 500 mV (below V_th = 830 mV) → non-disturbing,
+        // the stored conductance is preserved across reads (no destructive read).
+        const row = regs[d.rs1] & 0x3F;  // 0–63
+        const col = regs[d.rs2] & 0x3F;  // 0–63
+
+        switch (d.funct3) {
+          case 0x0: {
+            // CVLD — Non-disturbing load. Safe to read any cell (read V below V_th).
+            const G = this.crossbar.conductances[row][col];
+            this.writeReg(thread, d.rd, conductanceToValue(G));
+            break;
+          }
+          case 0x1: {
+            // CVST — Bounds-enforced store. Only cols [17, 61] are programmable;
+            // writes to reserved cols are silently dropped to protect stored bits
+            // in the register file, weight matrix, and XA scratch regions.
+            if (col >= CV_DATA.COL_START && col <= CV_DATA.COL_END) {
+              this.writeMemristorCell(
+                row, col, regs[d.rd],
+                `var[${row}][${col}]`
+              );
+            }
             break;
           }
         }

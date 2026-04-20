@@ -40,6 +40,8 @@ export interface PerformanceMetrics {
   imcOperations: number;         // MVM crossbar instructions
   crossbarWriteOps: number;      // CSET instructions
   crossbarArithOps: number;      // XADD + XSUB + XMUL instructions (custom-1)
+  cvLoadOps: number;             // CVLD crossbar variable load (custom-2)
+  cvStoreOps: number;            // CVST crossbar variable store (custom-2)
   barrierCount: number;
   estimatedCycles: number;
   crossbarCyclesSaved: number;   // Cycles saved vs scalar multiply-accumulate
@@ -87,7 +89,7 @@ export const MEMRISTOR_PHYSICS = {
   RMSE_NS:       42,           // nS  — write accuracy RMSE target → achieved
   SNR_DB:        73,           // dB  — signal-to-noise ratio (73–79 dB range)
   CROSSBAR_SIZE: 64,           // 64×64 molecular memristor array
-  MATERIAL:      '[RuIIL](BF₄)₂ kinetic molecular memristor',
+  MATERIAL:      'Memristor-Based Crossbar',
   PAPER_REF:     'Nature 633, Sep 2024',
 } as const;
 
@@ -117,6 +119,7 @@ export enum RVOpcode {
   LUI      = 0x37,  // Load upper immediate
   CUSTOM0  = 0x0B,  // Custom-0: MVM / SLDR / SSTR / CSET (memristor crossbar)
   CUSTOM1  = 0x2B,  // Custom-1: XADD / XSUB / XMUL  (crossbar integer arithmetic)
+  CUSTOM2  = 0x5B,  // Custom-2: CVLD / CVST           (crossbar variable load/store)
   MISC_MEM = 0x0F,  // FENCE (thread barrier)
   SYSTEM   = 0x73,  // ECALL (thread completion)
 }
@@ -132,6 +135,7 @@ export const OPCODE_NAMES: Record<number, string> = {
   [RVOpcode.LUI]:      'LUI',
   [RVOpcode.CUSTOM0]:  'IMC',
   [RVOpcode.CUSTOM1]:  'XA',
+  [RVOpcode.CUSTOM2]:  'CVMEM',
   [RVOpcode.MISC_MEM]: 'FENCE',
   [RVOpcode.SYSTEM]:   'ECALL',
 };
@@ -189,6 +193,25 @@ export const XA_SCRATCH = {
   XADD_ROW_A: 32, XADD_ROW_B: 33, XADD_ROW_R: 34,
   XSUB_ROW_A: 35, XSUB_ROW_B: 36, XSUB_ROW_R: 37,
   XMUL_ROW_V: 38, XMUL_ROW_G: 39, XMUL_ROW_R: 40,
+} as const;
+
+/**
+ * Crossbar variable data region for custom-2 CVLD/CVST.
+ *
+ * Memory mapping (safe zones only — no overlap with reserved regions):
+ *   Col  0         — register-file backing (reserved)
+ *   Cols 1–16      — MVM weight matrix     (reserved)
+ *   Cols 17–61     — variable data region  ← CVLD/CVST safe zone
+ *   Col  62        — XA arithmetic scratch (reserved)
+ *   Col  63        — reserved
+ *
+ * Read path:  V_read ≤ 500 mV (below V_th = 830 mV) — non-disturbing.
+ * Write path: pot/dep pulse sequence; bounds-enforced in hardware sim.
+ */
+export const CV_DATA = {
+  COL_START: 17,   // first safe column for variable storage
+  COL_END:   61,   // last safe column  (inclusive)
+  ROW_COUNT: 64,   // all 64 rows available within the data region
 } as const;
 
 /** Full IMC simulation state at one cycle */

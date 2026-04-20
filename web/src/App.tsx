@@ -59,7 +59,7 @@ export default function App() {
         </h1>
         <span style={{ color: '#555', fontSize: '12px' }}>|</span>
         <span style={{ color: '#888', fontSize: '12px' }}>
-          Memristor Crossbar In-Memory Compute Visualizer
+          Memristor-Based Crossbar · In-Memory Compute Visualizer
         </span>
 
         <div style={{ flex: 1 }} />
@@ -99,9 +99,9 @@ export default function App() {
             padding: '6px 12px', background: '#111', fontSize: '11px', color: '#888',
             borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: '6px',
           }}>
-            <span style={{ color: '#e06c75' }}>{'\u25CF'}</span> Source Code (.tgc)
+            <span style={{ color: '#e06c75' }}>{'\u25CF'}</span> Kernel Source · .tgc
             <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#555' }}>
-              + <code style={{ color: '#4ec9b0' }}>mvm(out, in)</code> for crossbar
+              DSL: <code style={{ color: '#4ec9b0' }}>mvm · cset · xadd/xsub/xmul · cvld/cvst</code>
             </span>
           </div>
           <div style={{ flex: 1 }}>
@@ -117,13 +117,15 @@ export default function App() {
               padding: '6px 12px', background: '#111', fontSize: '11px', color: '#888',
               borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: '6px',
             }}>
-              <span style={{ color: '#c586c0' }}>{'\u25CF'}</span> RISC-V IMC Compilation Pipeline
+              <span style={{ color: '#c586c0' }}>{'\u25CF'}</span> Compilation Pipeline · RISC-V RV32IM + IMC Extensions
               {trace.analysis?.metrics && (
                 <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#4ec9b0' }}>
                   {trace.analysis.metrics.totalInstructions} inst | {trace.analysis.metrics.registersUsed} regs
                   {trace.analysis.metrics.imcOperations > 0 && ` | ${trace.analysis.metrics.imcOperations} MVM`}
                   {(trace.analysis.metrics.crossbarWriteOps ?? 0) > 0 && ` | ${trace.analysis.metrics.crossbarWriteOps} CSET`}
                   {(trace.analysis.metrics.crossbarArithOps ?? 0) > 0 && ` | ${trace.analysis.metrics.crossbarArithOps} XA`}
+                  {(trace.analysis.metrics.cvLoadOps ?? 0) > 0 && ` | ${trace.analysis.metrics.cvLoadOps} CVLD`}
+                  {(trace.analysis.metrics.cvStoreOps ?? 0) > 0 && ` | ${trace.analysis.metrics.cvStoreOps} CVST`}
                   {trace.analysis.metrics.sharedMemoryBytes > 0 && ` | ${trace.analysis.metrics.sharedMemoryBytes}B scratch`}
                 </span>
               )}
@@ -143,7 +145,7 @@ export default function App() {
               borderBottom: '1px solid #222', display: 'flex', alignItems: 'center',
               gap: '6px', flexShrink: 0,
             }}>
-              <span style={{ color: '#b5cea8' }}>{'\u25CF'}</span> 32-bit RISC-V Binary
+              <span style={{ color: '#b5cea8' }}>{'\u25CF'}</span> Machine Code · 32-bit RISC-V Encoding
               <span style={{ marginLeft: 'auto', fontSize: '10px' }}>
                 {trace.binary.instructions.length} instructions
               </span>
@@ -178,7 +180,7 @@ export default function App() {
                 borderRadius: '4px', cursor: 'pointer',
               }}
             >
-              <span style={{ color: '#61afef' }}>{'\u25CF'}</span> IMC Execution
+              <span style={{ color: '#61afef' }}>{'\u25CF'}</span> Crossbar Execution Engine
             </button>
             <button
               onClick={() => setRightPanel('analysis')}
@@ -190,7 +192,7 @@ export default function App() {
                 borderRadius: '4px', cursor: 'pointer',
               }}
             >
-              <span style={{ color: '#e5c07b' }}>{'\u25CF'}</span> Analysis
+              <span style={{ color: '#e5c07b' }}>{'\u25CF'}</span> Performance Analysis
             </button>
           </div>
           <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -218,10 +220,10 @@ export default function App() {
         <span>
           Built by{' '}
           <span style={{ color: '#4ec9b0' }}>Aasheik Saran</span>
-          {' '}| RISC-V RV32IM + Memristor Crossbar IMC | MLIR + React
+          {' '}| RISC-V RV32IM + Memristor-Based Crossbar IMC | MLIR + React
         </span>
         <span>
-          32-bit RISC-V | custom-0 MVM extension | {trace.binary.instructions.length} ops compiled
+          custom-0: MVM/CSET · custom-1: XADD/XSUB/XMUL · custom-2: CVLD/CVST · {trace.binary.instructions.length} ops
         </span>
       </footer>
     </div>
