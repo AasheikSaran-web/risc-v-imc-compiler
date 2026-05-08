@@ -4,11 +4,13 @@ import { PipelineView } from './components/PipelineView';
 import { BinaryView } from './components/BinaryView';
 import { GPUSimulator } from './components/GPUSimulator';
 import { AnalysisPanel } from './components/AnalysisPanel';
+import { CrossCompilerTab } from './components/CrossCompilerTab';
 import { compileTGC } from './compiler/TGCCompiler';
 import { EXAMPLES } from './examples';
 import { CompilationTrace, SimulationState } from './compiler/types';
 
 type RightPanel = 'simulator' | 'analysis';
+type TopTab = 'kernel' | 'crosscompiler';
 
 export default function App() {
   const [source, setSource] = useState(EXAMPLES[0].source);
@@ -17,6 +19,7 @@ export default function App() {
   const [trace, setTrace] = useState<CompilationTrace>(() => compileTGC(EXAMPLES[0].source));
   const [highlightAddr, setHighlightAddr] = useState<number | undefined>(undefined);
   const [rightPanel, setRightPanel] = useState<RightPanel>('simulator');
+  const [topTab, setTopTab] = useState<TopTab>('kernel');
   const compileTimeout = useRef<number | null>(null);
 
   const handleSourceChange = useCallback((newSource: string) => {
@@ -88,8 +91,38 @@ export default function App() {
         </a>
       </header>
 
+      {/* Top tab bar */}
+      <div style={{
+        display: 'flex', alignItems: 'center', padding: '4px 14px',
+        background: '#111', borderBottom: '1px solid #222', gap: '6px', flexShrink: 0,
+      }}>
+        {([
+          { id: 'kernel',        label: 'Kernel Visualizer',  dot: '#61afef' },
+          { id: 'crosscompiler', label: 'C/Python Compiler',  dot: '#4ec9b0' },
+        ] as { id: TopTab; label: string; dot: string }[]).map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setTopTab(tab.id)}
+            style={{
+              padding: '4px 14px', fontSize: '11px', fontFamily: 'monospace',
+              background: topTab === tab.id ? '#2d5a3d' : 'transparent',
+              color:      topTab === tab.id ? '#7fff7f' : '#888',
+              border:     topTab === tab.id ? '1px solid #4a8a5a' : '1px solid transparent',
+              borderRadius: '4px', cursor: 'pointer',
+            }}
+          >
+            <span style={{ color: tab.dot, marginRight: '5px' }}>{'\u25CF'}</span>
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
       {/* Main layout */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      {topTab === 'crosscompiler' ? (
+        <CrossCompilerTab />
+      ) : (
+      <>
         {/* Left: Editor */}
         <div style={{
           width: '25%', minWidth: '240px', display: 'flex', flexDirection: 'column',
@@ -209,6 +242,8 @@ export default function App() {
             )}
           </div>
         </div>
+      </>
+      )}
       </div>
 
       {/* Footer */}
